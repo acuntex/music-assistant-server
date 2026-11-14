@@ -288,10 +288,13 @@ with, so the flow is neither restarted nor reopened and no second ffmpeg input i
   item's produced end and the end the declared durations gave.
 - A session that has the bus switched on selects float PCM for the flow (`overlay_active` in
   `select_flow_pcm_format`, i.e. the same path the queue overlay uses): summing a voice over music
-  needs the headroom. The choice is made at play start, like every other flow format decision.
-- A plugin that wants its clips over the queue's stream claims it for the queues it is active on
-  with `set_program_bus_required(queue_id, owner, required)`, on top of the setting; the claim
-  alone enables nothing.
+  needs the headroom. The choice is made at play start, like every other flow format decision. A
+  session that passes a source format through instead (S16 with the source's own content type, or
+  anything but S16LE/F32LE) can not mix, and a lead is then left in the clip's own stream rather
+  than taken out of it.
+- Programs never duck at the same time: a placement that would overlap one already scheduled is
+  moved to the end of that program's window, and one whose window would fall outside its
+  `stop_frame` is dropped, so its stream plays it whole.
 - `PROGRAM-BUS` debug lines: the session opening, each `schedule` with its `label` and `anchor`,
   a program that starts `late`, `drained`, `cancel` with its `reason`, and the anchor drift of a
   lead.
@@ -299,10 +302,11 @@ with, so the flow is neither restarted nor reopened and no second ffmpeg input i
 `PlayerController.play_announcement(..., mode="overlay")` renders the clip completely, converts it
 to the session's PCM format and places it on the bus, so the player keeps playing and the
 announcement is heard once across the item it lands in. The gate is a single place in the player
-controller: overlay mode, a flow mode player, the setting on, and either an owner claim or the
-player's own live flow session. Anything else — including the clip not being available — falls
-back to (or raises before) today's device route, which covers native announcement support and the
-builtin fallback.
+controller: overlay mode, a flow mode player, the setting on, and a live flow session on the
+player's queue. Anything else — including the clip not being available — falls back to (or raises
+before) today's device route, which covers native announcement support and the builtin fallback.
+On a group player an overlay rides the group's own stream as one mix, so every member hears it in
+step; only the device route fans out to the individual members.
 
 ## Audio Overlay
 

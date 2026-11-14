@@ -112,6 +112,7 @@ from music_assistant.controllers.streams.constants import (
     ICY_PLACEHOLDER_IMAGE_URLS,
     LEAD_HOLD_CEILING,
     LEAD_MIN_LEAD_SECONDS,
+    MAX_LEAD_OVERLAP,
     MIN_VOICE_OVER_DURATION,
     NO_TRACK_MATCH_EXPIRATION,
     NORMALIZATION_LIMITER_CEILING_DB,
@@ -359,6 +360,19 @@ def overlay_mixed_in(queue: PlayerQueue, queue_item: QueueItem, *, flow_mode: bo
     return flow_mode or queue_item.media_type == MediaType.RADIO
 
 
+def _pcm_mix_codec(pcm_format: AudioFormat) -> str | None:
+    """
+    Return the codec a program is mixed in for the given PCM format, if it can be mixed.
+
+    :param pcm_format: PCM format of the flow's audio.
+    """
+    if pcm_format.content_type == ContentType.PCM_F32LE and pcm_format.bit_depth == 32:
+        return "f32"
+    if pcm_format.content_type == ContentType.PCM_S16LE and pcm_format.bit_depth == 16:
+        return "s16"
+    return None
+
+
 class _ProgramOverlay:
     """
     Sum a scheduled program over the flow's music, starting at an absolute frame.
@@ -385,23 +399,22 @@ class _ProgramOverlay:
         """
         self._frame_size = (pcm_format.bit_depth // 8) * pcm_format.channels
         self._sample_rate = pcm_format.sample_rate
-        if pcm_format.content_type == ContentType.PCM_F32LE and pcm_format.bit_depth == 32:
-            self._codec: str | None = "f32"
+        self._codec = _pcm_mix_codec(pcm_format)
+        if self._codec == "f32":
             self._unpack = struct.Struct(f"<{pcm_format.channels}f").unpack
             self._pack = struct.Struct(f"<{pcm_format.channels}f").pack
-        elif pcm_format.bit_depth == 16:
-            self._codec = "s16"
+        elif self._codec == "s16":
             self._unpack = struct.Struct(f"<{pcm_format.channels}h").unpack
             self._pack = struct.Struct(f"<{pcm_format.channels}h").pack
-        else:
-            self._codec = None
         self.label = ""
         self.voice_pcm = voice_pcm
         self.voice_frames = len(voice_pcm) // self._frame_size if self._frame_size else 0
         self.start_frame = max(0, start_frame)
-        ramp = max(1, int(VOICE_OVER_RAMP * self._sample_rate))
-        self.duck_head = ramp
-        self.duck_tail = ramp
+        self._ramp = max(1, int(VOICE_OVER_RAMP * self._sample_rate))
+        # the duck-in ramp never lasts longer than the voice: a shorter one would still be
+        # on its way down when the voice ends, stepping instead of reaching full duck
+        self.duck_head = min(self._ramp, max(1, self.voice_frames))
+        self.duck_tail = self._ramp
         # the mix is capped at the ceiling the boundary's voice-over limiter holds, so a
         # full-scale voice summed over full-scale music saturates instead of wrapping
         self.ceiling = 10 ** (MIX_CEILING_DB / 20)
@@ -438,6 +451,7 @@ class _ProgramOverlay:
         self.voice_pcm = self.voice_pcm[skip * self._frame_size :]
         self.voice_frames -= skip
         self.start_frame += skip
+        self.duck_head = min(self._ramp, max(1, self.voice_frames))
         self._voice_end = self.start_frame + self.voice_frames
         self.end_frame = self._end_of(self._voice_end + self.duck_tail)
         return self.usable
@@ -534,6 +548,11 @@ class _FlowProgramBus:
         return self._pcm_format
 
     @property
+    def can_mix(self) -> bool:
+        """Return whether a program can be mixed in the flow's PCM format at all."""
+        return self._frame_size > 0 and _pcm_mix_codec(self._pcm_format) is not None
+
+    @property
     def frame_size(self) -> int:
         """Return the size in bytes of one frame of the flow's PCM format."""
         return self._frame_size
@@ -551,7 +570,8 @@ class _FlowProgramBus:
 
         A frame that was already produced can not be mixed any more: the program is moved
         forward to the current frame (and logged as late) or dropped when its whole window
-        has already gone by.
+        has already gone by. A frame inside a program that is already scheduled is moved to
+        the end of that program's window, so two programs never duck the music at once.
 
         :param pcm: The program's audio, in the flow's PCM format.
         :param start_frame: Frame the voice starts at, or None to start at the current frame.
@@ -564,7 +584,9 @@ class _FlowProgramBus:
         if not pcm or not self._frame_size:
             self._logger.debug("PROGRAM-BUS schedule label=%s dropped: no audio", label)
             return None
+        frames = len(pcm) // self._frame_size
         anchor = self.produced_frames if start_frame is None else start_frame
+        anchor = self._clear_of_scheduled(anchor, frames)
         overlay = _ProgramOverlay(pcm, self._pcm_format, anchor, stop_frame)
         overlay.label = label
         if not overlay.usable:
@@ -572,6 +594,12 @@ class _FlowProgramBus:
                 "PROGRAM-BUS schedule label=%s dropped: %s can not be mixed",
                 label,
                 self._pcm_format.content_type,
+            )
+            return None
+        if overlay.end_frame <= overlay.start_frame:
+            self._logger.debug(
+                "PROGRAM-BUS schedule label=%s dropped: its window is taken by another program",
+                label,
             )
             return None
         clamp = max(0, self.produced_frames - overlay.start_frame)
@@ -664,6 +692,34 @@ class _FlowProgramBus:
             "PROGRAM-BUS cancel reason=%s label=%s", reason, ",".join(o.label for o in remaining)
         )
 
+    # --- Private methods ---
+
+    def _clear_of_scheduled(self, anchor: int, frames: int) -> int:
+        """
+        Return the anchor moved past every scheduled program its window would overlap.
+
+        :param anchor: Frame the program would start at.
+        :param frames: Number of frames the program lasts.
+        """
+        moved = True
+        while moved:
+            moved = False
+            for overlay in self._overlays:
+                if anchor < overlay.end_frame and anchor + frames > overlay.start_frame:
+                    anchor = overlay.end_frame
+                    moved = True
+        return anchor
+
+
+@dataclass(frozen=True)
+class _LeadAnchorReport:
+    """Where a lead's head was placed, relative to the end the item really produced."""
+
+    drift_ms: float
+    anchor: int
+    produced_end: int
+    declared_end: int
+
 
 class _ProgramLead:
     """
@@ -710,6 +766,18 @@ class _ProgramLead:
         self._holding = False
         self._anchor: int | None = None
         self._cancel_generation = program_bus.cancel_generation
+        self._placed = False
+        self._report: _LeadAnchorReport | None = None
+
+    @property
+    def placed(self) -> bool:
+        """Return whether the head is placed on the bus."""
+        return self._placed
+
+    @property
+    def anchor_report(self) -> _LeadAnchorReport | None:
+        """Return where the head was placed relative to the item's end, once known."""
+        return self._report
 
     def arm(self) -> int | None:
         """
@@ -723,6 +791,7 @@ class _ProgramLead:
             label=self.label,
             stop_frame=self._declared_anchor + self.voice_frames,
         )
+        self._placed = self._anchor is not None
         return self._anchor
 
     def feed(self, chunk: bytes) -> bytes:
@@ -768,17 +837,30 @@ class _ProgramLead:
         if self._hold_was_cancelled():
             # the queue moved on and its programs were dropped: this head goes with them
             self._holding = False
+            self._placed = False
             self._logger.debug("PROGRAM-BUS anchor label=%s dropped: cancelled", self.label)
             return tail
         if self._holding:
             self._holding = False
             end_frame = self._bus.produced_frames + held_bytes // self._frame_size
+            requested_anchor = end_frame - self.voice_frames
             self._anchor = self._bus.schedule(
                 self._pcm,
-                end_frame - self.voice_frames,
+                requested_anchor,
                 label=self.label,
                 stop_frame=end_frame,
             )
+            self._placed = self._anchor == requested_anchor
+            if not self._placed:
+                # another program took the tail's window: a head that does not end on the
+                # item's end would leave a hole before the body, so it is left to the clip
+                if self._anchor is not None:
+                    self._bus.cancel(self.label, "not on the item's end")
+                self._logger.debug(
+                    "PROGRAM-BUS anchor label=%s dropped: no room for it at the item's end",
+                    self.label,
+                )
+                return tail
         else:
             # nothing was held: the item's declared end is all the head was placed on
             end_frame = self._bus.produced_frames
@@ -803,14 +885,20 @@ class _ProgramLead:
         """
         if self._anchor is None:
             return
-        drift_ms = (self._anchor - (end_frame - self.voice_frames)) / self._sample_rate * 1000
+        report = _LeadAnchorReport(
+            drift_ms=(self._anchor - (end_frame - self.voice_frames)) / self._sample_rate * 1000,
+            anchor=self._anchor,
+            produced_end=end_frame,
+            declared_end=self._declared_anchor + self.voice_frames,
+        )
+        self._report = report
         self._logger.debug(
             "PROGRAM-BUS anchor drift=%.0fms label=%s anchor=%d produced_end=%d declared_end=%d",
-            drift_ms,
+            report.drift_ms,
             self.label,
-            self._anchor,
-            end_frame,
-            self._declared_anchor + self.voice_frames,
+            report.anchor,
+            report.produced_end,
+            report.declared_end,
         )
 
 
@@ -818,6 +906,7 @@ async def _through_program_bus(
     music: AsyncGenerator[bytes],
     program_bus: _FlowProgramBus,
     lead: _ProgramLead | None = None,
+    prefetcher: _IncomingFadePrefetcher | None = None,
 ) -> AsyncGenerator[bytes]:
     """
     Run an item's audio through the session's program bus.
@@ -825,6 +914,7 @@ async def _through_program_bus(
     :param music: The item's own stream.
     :param program_bus: The session's program bus.
     :param lead: The clip's head to place on this item's end, if one was armed for it.
+    :param prefetcher: The prefetch the head was taken out of, if any.
     """
     try:
         async for chunk in music:
@@ -839,6 +929,10 @@ async def _through_program_bus(
             # held back for is mixed through the bus with the head on top of it
             for held in lead.finish():
                 yield program_bus.feed(held)
+            if not lead.placed and prefetcher is not None:
+                # the head was taken out of the stream but can not be placed: drop that
+                # prefetch, so the item's own stream plays it from the start
+                await prefetcher.close()
     finally:
         # closing this wrapper has to release the decoder underneath it as well
         await music.aclose()
@@ -3421,17 +3515,6 @@ class StreamsAudio:
                             requested_mode = CrossfadeMode.DISABLED
                         else:
                             requested_mode = CrossfadeMode.VOICE_OVER
-                    # DEBUG-INSTRUMENTATION (ci branch): the boundary side of the handshake
-                    self.logger.debug(
-                        "LEAD-BOUNDARY in=%s(%s) out=%s lead=%r raw=%r from=%r tail_held=%.2fs",
-                        queue_track.queue_item_id,
-                        queue_track.media_type,
-                        outgoing_queue_track.queue_item_id if outgoing_queue_track else None,
-                        lead_seconds,
-                        queue_track.extra_attributes.get(PRE_OVERLAP_ATTR),
-                        queue_track.extra_attributes.get(PRE_OVERLAP_FROM_ATTR),
-                        len(last_fadeout_part) / pcm_sample_size,
-                    )
                     if requested_mode == CrossfadeMode.VOICE_OVER or (
                         crossfade_buffer_size > 0 and requested_mode != CrossfadeMode.DISABLED
                     ):
@@ -3530,7 +3613,8 @@ class StreamsAudio:
                     and (lead_head := incoming_prefetcher.head_mixed(queue_track)) is not None
                 ):
                     raw_seek_position = 0
-                    queue_track.streamdetails.seek_position = lead_head
+                    # the head is stream time; the queue reports media time
+                    queue_track.streamdetails.seek_position = lead_head * track_playback_speed
                     self.logger.debug(
                         "LEAD-OVERLAY body clip=%s(%s) lead=%.2fs",
                         queue_track.queue_item_id,
@@ -3589,7 +3673,9 @@ class StreamsAudio:
                         track_playback_speed,
                         incoming_prefetcher,
                     )
-                    item_stream = _through_program_bus(item_stream, program_bus, lead)
+                    item_stream = _through_program_bus(
+                        item_stream, program_bus, lead, incoming_prefetcher
+                    )
 
                 # closing here releases the decoders on an early exit,
                 # instead of leaving them to the garbage collector
@@ -3896,26 +3982,6 @@ class StreamsAudio:
                         else MIN_CROSSFADE_DURATION
                     )
                 )
-                # DEBUG-INSTRUMENTATION (ci branch): what the end-of-item block has to work with
-                self.logger.debug(
-                    "LEAD-HOLD item=%s(%s) mode=%s holding=%s buf_target=%dB held=%dB "
-                    "min=%dB lead_planned=%r next=%s",
-                    queue_track.queue_item_id,
-                    queue_track.media_type,
-                    item_crossfade_mode,
-                    holding_back,
-                    crossfade_buffer_size,
-                    len(crossfade_buffer),
-                    min_fade_out_size,
-                    lead_planned,
-                    self.mass.player_queues.get_next_item(
-                        queue.queue_id, queue_track.queue_item_id
-                    ).queue_item_id
-                    if self.mass.player_queues.get_next_item(
-                        queue.queue_id, queue_track.queue_item_id
-                    )
-                    else None,
-                )
                 if len(crossfade_buffer) >= min_fade_out_size and self.crossfade_allowed(
                     queue_track,
                     crossfade_mode=item_crossfade_mode,
@@ -4102,17 +4168,6 @@ class StreamsAudio:
             queue_item.queue_id, queue_item.queue_item_id
         )
         declared_lead = self._planned_lead(lead_source, queue_item.queue_item_id)
-        # DEBUG-INSTRUMENTATION (ci branch): why a lead is or is not applied here
-        self.logger.debug(
-            "LEAD-GATE out=%s(%s) next=%s(%s) raw=%r from=%r accepted=%r",
-            queue_item.queue_item_id,
-            queue_item.media_type,
-            getattr(lead_source, "queue_item_id", None),
-            getattr(lead_source, "media_type", None),
-            lead_source.extra_attributes.get(PRE_OVERLAP_ATTR) if lead_source else None,
-            lead_source.extra_attributes.get(PRE_OVERLAP_FROM_ATTR) if lead_source else None,
-            declared_lead,
-        )
         if (
             lead_source is not None
             and declared_lead is None
@@ -5788,6 +5843,16 @@ class StreamsAudio:
                 LEAD_MIN_LEAD_SECONDS,
             )
             return None
+        if not program_bus.can_mix:
+            # taking the head out of the stream is only worth it when the bus can sum it
+            # back in: a session that passes a source format through can not
+            self.logger.debug(
+                "Not starting %s over %s: %s PCM can not be mixed",
+                next_item.name,
+                queue_track.name,
+                pcm_format.content_type,
+            )
+            return None
         voice_pcm = await incoming_prefetcher.collect_head(next_item, lead_seconds)
         if not voice_pcm:
             self.logger.debug(
@@ -5803,18 +5868,6 @@ class StreamsAudio:
         self.logger.info(
             "Starting %s over the last %.1fs of %s", next_item.name, lead_seconds, queue_track.name
         )
-        # DEBUG-INSTRUMENTATION (ci branch): the head that goes into the running flow
-        self.logger.debug(
-            "LEAD-OVERLAY arm out=%s(%s) clip=%s(%s) lead=%.2fs start=%.2fs head=%dB anchor=%d",
-            queue_track.queue_item_id,
-            queue_track.media_type,
-            next_item.queue_item_id,
-            next_item.media_type,
-            lead_seconds,
-            (remaining_media - lead_seconds) / speed,
-            len(voice_pcm),
-            anchor,
-        )
         # the anchor the declared durations give is only a starting point: the head is
         # moved onto the item's produced end when its tail is released (see _ProgramLead)
         lead = _ProgramLead(
@@ -5824,7 +5877,16 @@ class StreamsAudio:
             label=f"lead:{next_item.queue_item_id}",
             declared_anchor=anchor,
         )
-        lead.arm()
+        if lead.arm() is None:
+            # the head was taken out of the stream but is not on the bus: close the
+            # prefetch so the clip's own stream plays it from the start
+            self.logger.debug(
+                "Not starting %s over %s: its head could not be placed",
+                next_item.name,
+                queue_track.name,
+            )
+            await incoming_prefetcher.close()
+            return None
         return lead
 
     @staticmethod
@@ -5842,7 +5904,7 @@ class StreamsAudio:
             return None
         if queue_item.extra_attributes.get(PRE_OVERLAP_FROM_ATTR) != outgoing_item_id:
             return None
-        return float(declared)
+        return min(float(declared), MAX_LEAD_OVERLAP)
 
     async def _await_pending_crossfade(
         self, queue: PlayerQueue, queue_item: QueueItem, session_id: str | None

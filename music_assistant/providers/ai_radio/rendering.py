@@ -780,15 +780,6 @@ class AIRadioRenderMixin:
         # the stream reads how far the break reaches back from the clip item itself
         queue_item.extra_attributes[ATTR_PRE_OVERLAP] = overlap
         queue_item.extra_attributes[ATTR_PRE_FROM] = planned_against
-        # DEBUG-INSTRUMENTATION (ci branch): who published what, on which object
-        self.logger.debug(
-            "LEAD-PUBLISH item=%s obj=%s pre=%.2fs from=%s queue=%s",
-            queue_item.queue_item_id,
-            id(queue_item),
-            overlap,
-            planned_against,
-            queue_item.queue_id,
-        )
 
     def _pre_skipped(self, track_name: str, reason: str) -> None:
         """

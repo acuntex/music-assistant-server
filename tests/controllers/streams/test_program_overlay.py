@@ -30,7 +30,6 @@ def _controller() -> Any:
     """Return a streams controller with nothing registered yet."""
     controller: Any = StreamsController.__new__(StreamsController)
     controller._program_buses = {}
-    controller._program_bus_owners = {}
     controller.logger = MagicMock()
     return controller
 
@@ -177,18 +176,3 @@ def test_the_program_bus_switch_is_the_streams_config_setting() -> None:
 
     assert controller.program_bus_enabled() is True
     controller.config.get_value.assert_called_once_with(CONF_STREAM_PROGRAM_BUS, False)
-
-
-def test_the_program_bus_claim_holds_while_any_owner_requires_it() -> None:
-    """Releasing one owner's claim leaves the bus required while another holds one."""
-    controller = _controller()
-
-    controller.set_program_bus_required("queue-1", "ai_radio", True)
-    controller.set_program_bus_required("queue-1", "other_plugin", True)
-    controller.set_program_bus_required("queue-1", "ai_radio", False)
-    still_required = controller.program_bus_required("queue-1")
-    controller.set_program_bus_required("queue-1", "other_plugin", False)
-
-    assert still_required
-    assert not controller.program_bus_required("queue-1")
-    assert not controller.program_bus_required("queue-2")

@@ -9,7 +9,7 @@ from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from music_assistant_models.enums import ContentType, PlayerFeature
+from music_assistant_models.enums import ContentType, PlayerFeature, PlayerType
 from music_assistant_models.errors import PlayerCommandFailed
 from music_assistant_models.media_items import AudioFormat
 
@@ -39,7 +39,6 @@ class _Harness:
         *,
         program_bus: bool = True,
         flow_mode: bool = True,
-        claimed: bool = False,
         active_bus: bool = True,
         clip_seconds: float = 3.0,
     ) -> None:
@@ -61,7 +60,6 @@ class _Harness:
                 program_bus if key == CONF_STREAM_PROGRAM_BUS else None
             )
         )
-        mock_mass.streams.program_bus_required = MagicMock(return_value=claimed)
         mock_mass.streams.program_bus_active = MagicMock(return_value=active_bus)
         mock_mass.streams.program_bus_format = MagicMock(return_value=FLOW_PCM_FORMAT)
         mock_mass.streams.schedule_overlay = MagicMock(return_value=True)
@@ -105,30 +103,27 @@ def mock_mass() -> MagicMock:
 
 
 @pytest.mark.parametrize(
-    ("program_bus", "flow_mode", "claimed", "active_bus", "expected_overlay", "reason"),
+    ("program_bus", "flow_mode", "active_bus", "expected_overlay", "reason"),
     [
-        (False, True, True, True, False, "the program bus setting is the kill switch"),
-        (True, True, False, False, False, "no claim and no live flow session"),
-        (True, False, True, True, False, "the player does not stream in flow mode"),
-        (True, True, True, False, True, "an owner claimed the queue's stream"),
-        (True, True, False, True, True, "the player's own flow session mixes programs"),
+        (False, True, True, False, "the program bus setting is the kill switch"),
+        (True, True, False, False, "the queue has no live flow session"),
+        (True, False, True, False, "the player does not stream in flow mode"),
+        (True, True, True, True, "the player's own flow session mixes programs"),
     ],
 )
 async def test_the_overlay_gate(
     mock_mass: MagicMock,
     program_bus: bool,
     flow_mode: bool,
-    claimed: bool,
     active_bus: bool,
     expected_overlay: bool,
     reason: str,
 ) -> None:
-    """Only a switched-on bus, a flow mode player and a claim or live session mix the clip."""
+    """Only a switched-on bus, a flow mode player and a live session mix the clip."""
     harness = _Harness(
         mock_mass,
         program_bus=program_bus,
         flow_mode=flow_mode,
-        claimed=claimed,
         active_bus=active_bus,
     )
 
@@ -139,9 +134,36 @@ async def test_the_overlay_gate(
     assert harness.device_play.await_count == (0 if expected_overlay else 1), reason
 
 
+async def test_an_overlay_on_a_group_is_mixed_once_into_the_group_stream(
+    mock_mass: MagicMock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A group overlay rides the group's own stream instead of becoming one clip per member."""
+    harness = _Harness(mock_mass)
+    provider = MockProvider("test_provider", instance_id="test", mass=mock_mass)
+    group = MockPlayer(provider, "group_1", "Group", player_type=PlayerType.GROUP)
+    harness.controller._players = {group.player_id: group}
+    # the members could otherwise take the fan-out route a device announcement uses
+    monkeypatch.setattr(
+        harness.controller, "_members_announce_in_step", MagicMock(return_value=True)
+    )
+    member_runner = AsyncMock()
+    monkeypatch.setattr(harness.controller, "_run_member_announcement", member_runner)
+
+    await harness.controller.play_announcement(
+        group.player_id, ANNOUNCEMENT_URL, mode=ANNOUNCEMENT_MODE_OVERLAY
+    )
+
+    # one mix on the group's queue, heard by every member in step ...
+    harness.mass.streams.schedule_overlay.assert_called_once()
+    assert harness.mass.streams.schedule_overlay.call_args.args[0] == QUEUE_ID
+    # ... and no per-member announcement of its own
+    member_runner.assert_not_awaited()
+    harness.device_play.assert_not_awaited()
+
+
 async def test_the_default_mode_never_touches_the_queue_stream(mock_mass: MagicMock) -> None:
     """Callers that do not ask for it keep today's announcement route."""
-    harness = _Harness(mock_mass, claimed=True, active_bus=True)
+    harness = _Harness(mock_mass, active_bus=True)
 
     await harness.announce()
 
@@ -151,7 +173,7 @@ async def test_the_default_mode_never_touches_the_queue_stream(mock_mass: MagicM
 
 async def test_the_device_mode_is_still_accepted_explicitly(mock_mass: MagicMock) -> None:
     """An explicit device mode is the same route as before."""
-    harness = _Harness(mock_mass, claimed=True, active_bus=True)
+    harness = _Harness(mock_mass, active_bus=True)
 
     await harness.announce(mode=ANNOUNCEMENT_MODE_DEVICE)
 
@@ -174,7 +196,7 @@ async def test_the_overlay_is_mixed_in_the_stream_format_with_its_label(
     mock_mass: MagicMock,
 ) -> None:
     """The rendered clip is converted to the session's PCM format and labelled for the log."""
-    harness = _Harness(mock_mass, claimed=True)
+    harness = _Harness(mock_mass)
     before = asyncio.all_tasks()
 
     await harness.announce(mode=ANNOUNCEMENT_MODE_OVERLAY)
@@ -195,7 +217,7 @@ async def test_the_overlay_is_mixed_in_the_stream_format_with_its_label(
 
 async def test_an_empty_render_fails_instead_of_ducking_without_audio(mock_mass: MagicMock) -> None:
     """Nothing is placed when the clip could not be rendered."""
-    harness = _Harness(mock_mass, claimed=True, clip_seconds=0.0)
+    harness = _Harness(mock_mass, clip_seconds=0.0)
 
     with pytest.raises(PlayerCommandFailed, match="not available"):
         await harness.announce(mode=ANNOUNCEMENT_MODE_OVERLAY)
@@ -208,7 +230,7 @@ async def test_a_stream_that_stopped_mixing_falls_back_to_the_device(
     mock_mass: MagicMock,
 ) -> None:
     """A session that ended between the gate and the placement still gets the announcement."""
-    harness = _Harness(mock_mass, claimed=True)
+    harness = _Harness(mock_mass)
     harness.mass.streams.schedule_overlay.return_value = False
 
     await harness.announce(mode=ANNOUNCEMENT_MODE_OVERLAY)
@@ -220,7 +242,7 @@ async def test_the_gate_is_reported_once_per_call(
     mock_mass: MagicMock, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A player without flow mode announces on the device and says why, once."""
-    harness = _Harness(mock_mass, flow_mode=False, claimed=True)
+    harness = _Harness(mock_mass, flow_mode=False)
 
     with caplog.at_level(logging.INFO):
         await harness.announce(mode=ANNOUNCEMENT_MODE_OVERLAY)

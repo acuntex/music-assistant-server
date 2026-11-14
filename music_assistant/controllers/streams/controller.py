@@ -385,10 +385,8 @@ class StreamsController(CoreController):
         # owners (e.g. a plugin) that require flow mode for a queue, by queue id
         self._flow_mode_owners: dict[str, set[str]] = {}
         self._boundary_mix_owners: dict[str, set[str]] = {}
-        # the program bus of every live flow session, by queue id, and the owners that
-        # require the queue's flow stream to keep mixing programs (e.g. a plugin)
+        # the program bus of every live flow session, by queue id
         self._program_buses: dict[str, _FlowProgramBus] = {}
-        self._program_bus_owners: dict[str, set[str]] = {}
 
     @property
     def audio_analysis(self) -> AudioAnalysisController:
@@ -587,28 +585,6 @@ class StreamsController(CoreController):
         """
         player = self.mass.players.get_player(queue_id)
         return player is not None and (player.flow_mode or player.supports_gapless)
-
-    def set_program_bus_required(self, queue_id: str, owner: str, required: bool) -> None:
-        """
-        Require (or release) that the queue's flow stream keeps mixing programs.
-
-        A plugin that wants its own audio heard over the queue's stream claims this for
-        the queues it is active on. The claim only turns anything on together with the
-        streams program bus setting, so releasing it restores the old behaviour.
-
-        :param queue_id: Queue whose flow stream must mix programs.
-        :param owner: Identifier of the requester, e.g. a provider instance id.
-        :param required: True to require it, False to release this owner's claim.
-        """
-        self._set_required(self._program_bus_owners, queue_id, owner, required)
-
-    def program_bus_required(self, queue_id: str) -> bool:
-        """
-        Return whether any owner requires the queue's flow stream to mix programs.
-
-        :param queue_id: Queue to check.
-        """
-        return queue_id in self._program_bus_owners
 
     def program_bus_enabled(self) -> bool:
         """Return whether the streams program bus is switched on (it is experimental)."""

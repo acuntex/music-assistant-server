@@ -214,7 +214,6 @@ class AIRadioProvider(
             if state.task and not state.task.done():
                 state.task.cancel()
             self.mass.streams.set_boundary_mix_required(queue_id, self.instance_id, False)
-            self.mass.streams.set_program_bus_required(queue_id, self.instance_id, False)
         self._cancel_renders_ahead()
         for handle in self._unregister_handles:
             handle()

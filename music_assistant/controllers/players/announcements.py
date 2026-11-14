@@ -225,6 +225,8 @@ class AnnouncementsMixin:
             over for the clip (the native route where the player has one), 'overlay'
             mixes the clip over the queue's flow stream while it keeps playing. Overlay
             falls back to the device route when the queue's stream can not carry it.
+            On a group player an overlay is mixed into the group's own stream once, so
+            every member hears it in step; only the device route fans out to the members.
         """
         player = self.get_player(player_id, True)
         assert player is not None  # for type checking
@@ -407,21 +409,22 @@ class AnnouncementsMixin:
         try:
             # mark announcement_in_progress on player
             player.extra_data[ATTR_ANNOUNCEMENT_IN_PROGRESS] = True
-            if player.state.type == PlayerType.GROUP:
+            if player.state.type == PlayerType.GROUP and mode == ANNOUNCEMENT_MODE_DEVICE:
                 # the output that announces for a member is resolved once the audio is
                 # there, so the decision below is taken on the state the members act on
                 await render.wait_ready()
                 # a group announcement is only handed to the individual members when the output
                 # that would announce for each member can line up its start with the others.
                 # Members that cannot would be heard out of step, so such a group plays the clip
-                # through its own (synchronized) stream instead.
+                # through its own (synchronized) stream instead. An overlay is never handed out:
+                # it rides the group's own stream as one mix, heard in step by every member.
                 if self._members_announce_in_step(player, volume_level):
                     # forward the request to each individual player
                     async with TaskManager(self.mass) as tg:
                         for member in self.iter_group_members(player):
                             tg.create_task(
                                 self._run_member_announcement(
-                                    member, announce_data.copy(), volume_level
+                                    member, announce_data.copy(), volume_level, mode=mode
                                 )
                             )
                     return
@@ -486,7 +489,12 @@ class AnnouncementsMixin:
             await self.mass.streams.announcement_renderer.unregister(player.player_id, render)
 
     async def _run_member_announcement(
-        self, member: Player, announce_data: AnnounceData, volume_level: int | None
+        self,
+        member: Player,
+        announce_data: AnnounceData,
+        volume_level: int | None,
+        *,
+        mode: AnnouncementMode = ANNOUNCEMENT_MODE_DEVICE,
     ) -> None:
         """
         Play a group's announcement on one of its members, under the member's own lock.
@@ -497,17 +505,19 @@ class AnnouncementsMixin:
         :param member: The group member the announcement is played on.
         :param announce_data: The announcement to play.
         :param volume_level: Optional volume level override for the announcement.
+        :param mode: How the announcement reaches the member, see play_announcement.
         """
         async with self.get_player_lock(member.player_id, PlayerLockPurpose.PLAYBACK):
-            await self._run_announcement(member, announce_data, volume_level, native_only=True)
+            await self._run_announcement(
+                member, announce_data, volume_level, native_only=True, mode=mode
+            )
 
     def _overlay_announcement_blocked(self, player: Player) -> str | None:
         """
         Return why an announcement can not be mixed over the queue's stream, or None.
 
         The overlay needs the streams program bus switched on, a player that streams in
-        flow mode, and a queue whose flow stream is mixing programs: either an owner
-        claimed it or the player itself plays such a stream right now.
+        flow mode, and a queue whose flow stream is mixing programs right now.
 
         :param player: The player the announcement is played on.
         """
@@ -518,9 +528,7 @@ class AnnouncementsMixin:
         queue = self.get_active_queue(player)
         if queue is None:
             return "the player has no active queue"
-        if self.mass.streams.program_bus_required(
-            queue.queue_id
-        ) or self.mass.streams.program_bus_active(queue.queue_id):
+        if self.mass.streams.program_bus_active(queue.queue_id):
             return None
         return "the queue's flow stream is not mixing programs"
 

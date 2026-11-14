@@ -90,7 +90,6 @@ async def test_skip_leaves_no_overlay_or_task_behind() -> None:
     ctrl._apply_pending_skip = AsyncMock()  # type: ignore[method-assign]
     streams: Any = StreamsController.__new__(StreamsController)
     streams._program_buses = {}
-    streams._program_bus_owners = {}
     streams.logger = MagicMock()
     ctrl.mass.streams = streams
     program_bus = _FlowProgramBus(TEST_PCM_FORMAT, cast("Any", MagicMock()))
