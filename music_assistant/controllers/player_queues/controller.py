@@ -1106,6 +1106,8 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         if next_index is None:
             self._set_transitioning(queue_id, False)
             return
+        # an announcement mixed into the stream says nothing about the item that follows
+        self.mass.streams.cancel_overlays(queue_id, reason="next")
 
         # immediately update current item so UI shows the new track right away
         queue.current_index = next_index
@@ -1149,6 +1151,8 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         # restart current track if elapsed > 5s, otherwise go to previous
         if queue.corrected_elapsed_time < 5:
             prev_index = max(current_index - 1, 0)
+        # an announcement mixed into the stream says nothing about the item that follows
+        self.mass.streams.cancel_overlays(queue_id, reason="previous")
 
         # immediately update current item so UI shows the new track right away
         queue.current_index = prev_index
@@ -1189,6 +1193,8 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
             raise InvalidCommand(f"Queue {queue.display_name} has no item(s) loaded.")
         if not current_item.duration:
             raise InvalidCommand("Can not skip in items without duration.")
+        # an announcement mixed into the stream says nothing about the position it jumps to
+        self.mass.streams.cancel_overlays(queue_id, reason="skip")
         queue_data = self._queue_data[queue_id]
         if queue_data.pending_skip_item_id != current_item.queue_item_id:
             queue_data.pending_skip_seconds = 0
@@ -1316,6 +1322,8 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
     ) -> None:
         """Play item at index (or item_id) X in queue."""
         self._check_player_permission(queue_id)
+        # a jump to another item is no place for an announcement mixed into this one
+        self.mass.streams.cancel_overlays(queue_id, reason="play_index")
         await self._play_index(queue_id, index, seek_position or None, fade_in)
 
     @api_command(

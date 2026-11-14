@@ -125,10 +125,15 @@ class FakeMass:
         self.timers: list[tuple[float, Callable[..., Any], tuple[Any, ...], str | None]] = []
         # (queue_id, required) for every boundary-mix requirement the DJ placed or released
         self.boundary_mix_calls: list[tuple[str, bool]] = []
+        # the same for the program bus, which an armed host requires
+        self.program_bus_calls: list[tuple[str, bool]] = []
         self.streams = SimpleNamespace(
             set_boundary_mix_required=lambda queue_id, _owner, required: (
                 self.boundary_mix_calls.append((queue_id, required))
-            )
+            ),
+            set_program_bus_required=lambda queue_id, _owner, required: (
+                self.program_bus_calls.append((queue_id, required))
+            ),
         )
 
     def create_task(
@@ -459,6 +464,8 @@ async def test_arming_a_posting_show_requires_mixed_boundaries(tmp_path: Path) -
     await dj._ensure_show_dj("q1")
 
     assert dj.mass.boundary_mix_calls == [("q1", True)]
+    # an armed host speaks over the queue's stream, so it claims the program bus as well
+    assert dj.mass.program_bus_calls[-1] == ("q1", True)
 
 
 async def test_arming_a_show_without_posting_sections_asks_for_nothing(tmp_path: Path) -> None:
@@ -469,6 +476,8 @@ async def test_arming_a_show_without_posting_sections_asks_for_nothing(tmp_path:
     await dj._ensure_show_dj("q1")
 
     assert dj.mass.boundary_mix_calls == []
+    # its clips still play over the queue's stream, whatever their sections allow
+    assert dj.mass.program_bus_calls[-1] == ("q1", True)
 
 
 async def test_disabling_the_show_dj_releases_the_requirement(tmp_path: Path) -> None:
@@ -481,6 +490,7 @@ async def test_disabling_the_show_dj_releases_the_requirement(tmp_path: Path) ->
     await dj.set_queue_dj("q1", None)
 
     assert dj.mass.boundary_mix_calls == [("q1", True), ("q1", False)]
+    assert dj.mass.program_bus_calls[-1] == ("q1", False)
 
 
 async def test_ensure_show_dj_skips_when_already_armed_this_play(tmp_path: Path) -> None:
@@ -2074,14 +2084,16 @@ def test_a_section_edit_rearms_the_boundary_claim(tmp_path: Path) -> None:
     dj._hosts["amy"]["section_ids"] = ["talk"]
     dj._arm_dj_state("q1", "amy")
 
-    dj._refresh_boundary_mix_claims()
+    dj._refresh_stream_claims()
     assert dj.mass.boundary_mix_calls[-1] == ("q1", False)
 
     dj._sections["talk"]["allow_pre"] = True
-    dj._refresh_boundary_mix_claims()
+    dj._refresh_stream_claims()
     assert dj.mass.boundary_mix_calls[-1] == ("q1", True)
 
     dj._sections["talk"]["allow_pre"] = False
     dj._sections["talk"]["allow_post"] = True
-    dj._refresh_boundary_mix_claims()
+    dj._refresh_stream_claims()
     assert dj.mass.boundary_mix_calls[-1] == ("q1", True)
+    # the program bus claim follows the host being armed, not the sections
+    assert dj.mass.program_bus_calls[-1] == ("q1", True)

@@ -516,6 +516,11 @@ class _FlowProgramBus:
         """Return whether a scheduled program is still to be heard."""
         return bool(self._overlays)
 
+    @property
+    def pcm_format(self) -> AudioFormat:
+        """Return the PCM format of the flow this bus belongs to."""
+        return self._pcm_format
+
     def schedule(
         self,
         pcm: bytes,
@@ -3036,6 +3041,9 @@ class StreamsAudio:
         program_bus: _FlowProgramBus | None = None
         if self.mass.streams.get_config_value(CONF_STREAM_PROGRAM_BUS, False, return_type=bool):
             program_bus = _FlowProgramBus(pcm_format, self.logger)
+            # published while the session runs, so a program (e.g. an announcement) can be
+            # mixed into this stream instead of interrupting it
+            self.mass.streams.register_program_bus(queue.queue_id, program_bus)
             self.logger.debug(
                 "PROGRAM-BUS session %s opened for queue %s", flow_session_id, queue.display_name
             )
@@ -3775,6 +3783,7 @@ class StreamsAudio:
         finally:
             if program_bus is not None:
                 program_bus.cancel_all("flow stream ended")
+                self.mass.streams.release_program_bus(queue.queue_id, program_bus)
             await incoming_prefetcher.close()
         #### HANDLE END OF QUEUE FLOW STREAM
         # skip end-of-queue bookkeeping if a newer producer has superseded us;

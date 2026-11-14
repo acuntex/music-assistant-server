@@ -82,12 +82,17 @@ class AIRadioQueueDJMixin:
                 if host_id is None:
                     self._dj_queues.pop(queue_id, None)
                     self.mass.streams.set_boundary_mix_required(queue_id, self.instance_id, False)
+                    self.mass.streams.set_program_bus_required(queue_id, self.instance_id, False)
                 else:
                     host_id = str(host_id).strip()
                     if host_id not in self._hosts:
                         raise InvalidDataError(f"Unknown host id: {host_id}")  # noqa: TRY301 - re-raised after cleanup
                     previous = self._dj_queues.get(queue_id)
                     armed = self._arm_dj_state(queue_id, host_id)
+                    # an armed host speaks over the queue's own stream, so that stream has to
+                    # keep mixing programs; the streams setting stays the switch that
+                    # enables the bus at all
+                    self.mass.streams.set_program_bus_required(queue_id, self.instance_id, True)
                     if previous is not None:
                         # a mid-show host switch keeps the show binding
                         armed.station_id = previous.station_id
@@ -106,6 +111,9 @@ class AIRadioQueueDJMixin:
                 async with self._dj_lock:
                     if self._dj_queues.get(queue_id) is armed:
                         del self._dj_queues[queue_id]
+                        self.mass.streams.set_program_bus_required(
+                            queue_id, self.instance_id, False
+                        )
                         self.signal_provider_event({"event": EVENT_QUEUE_DJ_UPDATED})
             raise
         if armed is not None:
@@ -212,10 +220,13 @@ class AIRadioQueueDJMixin:
             # streams of a player that plays gapless and streams any other player in flow
             # mode, decided at the play start this arm precedes
             self.mass.streams.set_boundary_mix_required(queue_id, self.instance_id, True)
+        # the host speaks over the queue's stream whether or not it straddles a boundary
+        self.mass.streams.set_program_bus_required(queue_id, self.instance_id, True)
         try:
             await self.set_queue_dj(queue_id, host_id)
         except Exception:
             self.mass.streams.set_boundary_mix_required(queue_id, self.instance_id, False)
+            self.mass.streams.set_program_bus_required(queue_id, self.instance_id, False)
             raise
         if (state := self._dj_queues.get(queue_id)) is None:
             return
@@ -764,12 +775,14 @@ class AIRadioQueueDJMixin:
             "media_item": None,
         }
 
-    def _refresh_boundary_mix_claims(self) -> None:
+    def _refresh_stream_claims(self) -> None:
         """Re-evaluate which armed queues need their item boundaries mixed."""
         for queue_id, state in list(self._dj_queues.items()):
             self.mass.streams.set_boundary_mix_required(
                 queue_id, self.instance_id, self._host_mixes_boundary(state.host_id)
             )
+            # an armed host always speaks over the queue's stream
+            self.mass.streams.set_program_bus_required(queue_id, self.instance_id, True)
 
     def _host_mixes_boundary(self, host_id: str) -> bool:
         """Return whether any section of the host lets its break straddle a track boundary."""

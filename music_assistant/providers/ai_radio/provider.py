@@ -214,6 +214,7 @@ class AIRadioProvider(
             if state.task and not state.task.done():
                 state.task.cancel()
             self.mass.streams.set_boundary_mix_required(queue_id, self.instance_id, False)
+            self.mass.streams.set_program_bus_required(queue_id, self.instance_id, False)
         self._cancel_renders_ahead()
         for handle in self._unregister_handles:
             handle()
@@ -291,7 +292,7 @@ class AIRadioProvider(
         self.logger.info("AI Radio section saved: %s", normalized["id"])
         # an edit decides whether this host's breaks straddle a boundary: a queue it is
         # armed on picks that up when its current stream ends and the next one starts
-        self._refresh_boundary_mix_claims()
+        self._refresh_stream_claims()
         return deepcopy(normalized)
 
     async def delete_section(self, section_id: str) -> None:
@@ -341,7 +342,7 @@ class AIRadioProvider(
             await self._write_hosts()
         self.logger.info("AI Radio host saved: %s (%s)", normalized["id"], normalized["name"])
         # the host's sections decide the claim, so a changed list applies to its queues
-        self._refresh_boundary_mix_claims()
+        self._refresh_stream_claims()
         return deepcopy(normalized)
 
     async def delete_host(self, host_id: str) -> None:

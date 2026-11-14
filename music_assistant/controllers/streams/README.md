@@ -259,6 +259,40 @@ python -m scripts.smart_fades_replay \
     --n 3000 --seed 20261010 --buffer 45 --out /tmp/replay
 ```
 
+## Program Bus
+
+A flow session can mix short programs into its own PCM instead of interrupting playback. With
+the `stream_program_bus` setting on, `StreamsAudio.get_queue_flow_stream` opens one
+`_FlowProgramBus` for the session (behind `CONF_STREAM_PROGRAM_BUS`, off by default) and publishes
+it on the streams controller while it runs. The bus counts the frames the session produced, and a
+program is placed at a frame: while that frame goes by, its audio is summed over the music, which
+is ducked for its duration. Every chunk leaves the bus with the length and the size it came in
+with, so the flow is neither restarted nor reopened and no second ffmpeg input is used.
+
+- `StreamsController.schedule_overlay(queue_id, pcm, *, label)` places a program at
+  `now + LEAD_MIN_LEAD_SECONDS` (about 2 s, so the audio reaches the player in time; the bus
+  clamps a late placement forward and drops one whose window already passed) and returns False
+  when the queue has no live flow session.
+- `StreamsController.cancel_overlays(queue_id, reason)` drops what is still to be heard,
+  synchronously. The player queue controller calls it for `next`, `previous`, `skip` and
+  `play_index`; `stop` and `pause` leave the clip alone, and a session that ends drops its own
+  programs. Nothing is made up for later: the rest of the item plays without the duck.
+- An item's declared lead (the `ai_radio_pre_overlap` queue item attributes) is placed on the same
+  bus, anchored at the item's end.
+- A plugin that wants its clips over the queue's stream claims it for the queues it is active on
+  with `set_program_bus_required(queue_id, owner, required)`, on top of the setting; the claim
+  alone enables nothing.
+- `PROGRAM-BUS` debug lines: the session opening, each `schedule` with its `label` and `anchor`,
+  a program that starts `late`, `drained`, and `cancel` with its `reason`.
+
+`PlayerController.play_announcement(..., mode="overlay")` renders the clip completely, converts it
+to the session's PCM format and places it on the bus, so the player keeps playing and the
+announcement is heard once across the item it lands in. The gate is a single place in the player
+controller: overlay mode, a flow mode player, the setting on, and either an owner claim or the
+player's own live flow session. Anything else — including the clip not being available — falls
+back to (or raises before) today's device route, which covers native announcement support and the
+builtin fallback.
+
 ## Audio Overlay
 
 The audio overlay is a per-queue feature (configured via `player_queues/overlay`) that mixes a

@@ -572,6 +572,9 @@ async def test_unload_cancels_an_in_flight_queue_dj_replan() -> None:
 
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(replan_task, timeout=5)
+    # the queue no longer streams programs for a host that is gone
+    streams = cast("Any", provider.mass.streams)
+    streams.set_program_bus_required.assert_called_once_with("queue-1", "ai_radio", False)
 
 
 async def test_engine_recheck_stays_silent_when_the_provider_unloads_during_the_wait(

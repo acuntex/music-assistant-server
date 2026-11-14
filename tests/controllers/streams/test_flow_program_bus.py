@@ -288,6 +288,63 @@ async def test_the_program_bus_is_read_once_per_session(
     assert mass.streams.get_config_value.call_count == 1
 
 
+async def test_the_flow_session_publishes_and_withdraws_its_program_bus(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A running session is reachable for overlays and gone once it ends."""
+    audio, queue, mass, _opened, track = _lead_flow(monkeypatch, program_bus=True)
+
+    await _drain(_flow(audio, queue, track))
+
+    published = mass.streams.register_program_bus.call_args.args
+    assert published[0] == "queue-1"
+    mass.streams.release_program_bus.assert_called_once_with("queue-1", published[1])
+
+
+async def test_no_program_bus_is_published_when_the_switch_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With the experiment off there is nothing an overlay could be mixed into."""
+    audio, queue, mass, _opened, track = _lead_flow(monkeypatch, program_bus=False)
+
+    await _drain(_flow(audio, queue, track))
+
+    mass.streams.register_program_bus.assert_not_called()
+    mass.streams.release_program_bus.assert_not_called()
+
+
+async def test_an_abandoned_flow_session_still_withdraws_its_program_bus(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session the player closes early leaves no bus reachable behind."""
+    audio, queue, mass, _opened, track = _lead_flow(monkeypatch, program_bus=True)
+    stream = _flow(audio, queue, track)
+    assert await anext(stream)
+
+    await stream.aclose()
+
+    published = mass.streams.register_program_bus.call_args.args
+    mass.streams.release_program_bus.assert_called_once_with("queue-1", published[1])
+
+
+async def test_a_program_still_playing_is_dropped_when_the_session_ends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The session ends the programs it still had to play instead of leaving them behind."""
+    audio, queue, mass, _opened, track = _lead_flow(monkeypatch, program_bus=True)
+    published: list[_FlowProgramBus] = []
+
+    def _register(_queue_id: str, program_bus: _FlowProgramBus) -> None:
+        published.append(program_bus)
+        program_bus.schedule(_voice(LEAD_TRACK_SECONDS), 0, label="announcement")
+
+    mass.streams.register_program_bus.side_effect = _register
+
+    await _drain(_flow(audio, queue, track))
+
+    assert not published[0].active
+
+
 def test_the_voice_ramps_back_to_the_music_after_the_program() -> None:
     """The ducked music ramps up over the program's tail instead of jumping back."""
     bus = _bus()

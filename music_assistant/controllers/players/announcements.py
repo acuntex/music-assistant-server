@@ -16,7 +16,7 @@ import asyncio
 import logging
 import time
 from math import ceil
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Literal, cast
 
 from music_assistant_models.auth import Scope
 from music_assistant_models.constants import PLAYER_CONTROL_NATIVE, PLAYER_CONTROL_NONE
@@ -26,7 +26,7 @@ from music_assistant_models.enums import (
     PlayerFeature,
     PlayerType,
 )
-from music_assistant_models.errors import PlayerCommandFailed
+from music_assistant_models.errors import AudioError, PlayerCommandFailed
 from music_assistant_models.player import PlayerMedia
 
 from music_assistant.constants import (
@@ -42,6 +42,7 @@ from music_assistant.constants import (
     CONF_PRE_ANNOUNCE_CHIME_URL,
 )
 from music_assistant.controllers.streams.announcements import MAX_CLIP_SECONDS
+from music_assistant.controllers.streams.constants import CONF_STREAM_PROGRAM_BUS
 from music_assistant.helpers.api import api_command
 from music_assistant.helpers.plugin_engines import (
     engine_display_name,
@@ -63,6 +64,7 @@ if TYPE_CHECKING:
     from collections.abc import Iterator
     from contextlib import AbstractAsyncContextManager
 
+    from music_assistant_models.media_items import AudioFormat
     from music_assistant_models.player_queue import PlayerQueue
 
     from music_assistant import MusicAssistant
@@ -71,6 +73,18 @@ if TYPE_CHECKING:
 # the caller waits for this command and it holds the player's playback lock while it runs,
 # so a wedged engine must give up well before the generic (background) engine timeout
 ANNOUNCEMENT_TTS_TIMEOUT = 30
+
+# How an announcement is delivered: on the device, which takes it over for the clip's
+# duration, or mixed over the queue's own stream while that keeps playing.
+type AnnouncementMode = Literal["device", "overlay"]
+ANNOUNCEMENT_MODE_DEVICE: AnnouncementMode = "device"
+ANNOUNCEMENT_MODE_OVERLAY: AnnouncementMode = "overlay"
+ANNOUNCEMENT_MODES: tuple[AnnouncementMode, ...] = (
+    ANNOUNCEMENT_MODE_DEVICE,
+    ANNOUNCEMENT_MODE_OVERLAY,
+)
+# label of an announcement on the streams program bus, for its log lines
+ANNOUNCEMENT_OVERLAY_LABEL = "announcement"
 
 
 class AnnouncementsMixin:
@@ -190,6 +204,7 @@ class AnnouncementsMixin:
         message: str | None = None,
         tts_engine: str | None = None,
         language: str | None = None,
+        mode: str = ANNOUNCEMENT_MODE_DEVICE,
     ) -> None:
         """
         Handle playback of an announcement on given player.
@@ -206,9 +221,17 @@ class AnnouncementsMixin:
             defaults to the engine configured on the player controller.
         :param language: Optional language code to speak the message in (e.g. 'nl-NL'),
             omit to let the engine speak in the language it is configured for.
+        :param mode: How the announcement reaches the player: 'device' takes the player
+            over for the clip (the native route where the player has one), 'overlay'
+            mixes the clip over the queue's flow stream while it keeps playing. Overlay
+            falls back to the device route when the queue's stream can not carry it.
         """
         player = self.get_player(player_id, True)
         assert player is not None  # for type checking
+        if mode not in ANNOUNCEMENT_MODES:
+            raise PlayerCommandFailed(
+                f"Invalid mode '{mode}', expected one of {', '.join(ANNOUNCEMENT_MODES)}."
+            )
         if not url and not message:
             raise PlayerCommandFailed("Either a url or a message is required.")
         if url and message:
@@ -265,7 +288,7 @@ class AnnouncementsMixin:
                 # filled in once the player that fetches the stream is known
                 announce_player_id=None,
             )
-            await self._run_announcement(player, announce_data, volume_level)
+            await self._run_announcement(player, announce_data, volume_level, mode=mode)
 
     @api_command("players/tts_engines", required_scope=Scope.PLAYERS_CONTROL)
     async def get_announcement_tts_engines(self) -> list[dict[str, str]]:
@@ -364,6 +387,7 @@ class AnnouncementsMixin:
         volume_level: int | None,
         *,
         native_only: bool = False,
+        mode: AnnouncementMode = ANNOUNCEMENT_MODE_DEVICE,
     ) -> None:
         """
         Play an announcement on a player whose playback lock the caller holds.
@@ -374,6 +398,7 @@ class AnnouncementsMixin:
         :param native_only: Skip the announcement instead of using the default implementation
             when the player does not announce natively (any more). Set for a group member
             announcing under the group's lock, which the default implementation would need.
+        :param mode: How the announcement reaches the player, see play_announcement.
         """
         # Register right away, so the audio is (nearly always fully) rendered by the time
         # the player is ready for it. The render is shared by everything that consumes
@@ -407,6 +432,16 @@ class AnnouncementsMixin:
                 announce_data["pre_announce"],
                 url,
             )
+            if mode == ANNOUNCEMENT_MODE_OVERLAY:
+                blocked = self._overlay_announcement_blocked(player)
+                if blocked is None and await self._play_overlay_announcement(player, render):
+                    return
+                self.logger.info(
+                    "Announcement to player %s - not mixing it over the queue's stream (%s), "
+                    "playing it as a device announcement",
+                    player.state.name,
+                    blocked or "the queue's stream is not mixing programs right now",
+                )
             announce_player = await self._resolve_ready_announce_player(
                 player, render, url, volume_level
             )
@@ -465,6 +500,85 @@ class AnnouncementsMixin:
         """
         async with self.get_player_lock(member.player_id, PlayerLockPurpose.PLAYBACK):
             await self._run_announcement(member, announce_data, volume_level, native_only=True)
+
+    def _overlay_announcement_blocked(self, player: Player) -> str | None:
+        """
+        Return why an announcement can not be mixed over the queue's stream, or None.
+
+        The overlay needs the streams program bus switched on, a player that streams in
+        flow mode, and a queue whose flow stream is mixing programs: either an owner
+        claimed it or the player itself plays such a stream right now.
+
+        :param player: The player the announcement is played on.
+        """
+        if not self.mass.streams.get_config_value(CONF_STREAM_PROGRAM_BUS, False, return_type=bool):
+            return "the streams program bus is switched off"
+        if not player.flow_mode:
+            return "the player does not stream in flow mode"
+        queue = self.get_active_queue(player)
+        if queue is None:
+            return "the player has no active queue"
+        if self.mass.streams.program_bus_required(
+            queue.queue_id
+        ) or self.mass.streams.program_bus_active(queue.queue_id):
+            return None
+        return "the queue's flow stream is not mixing programs"
+
+    async def _play_overlay_announcement(self, player: Player, render: AnnouncementRender) -> bool:
+        """
+        Mix the announcement over the queue's flow stream instead of taking the player over.
+
+        The clip is rendered completely before it is placed, so it is heard once and the
+        duck it applies can never start without its audio.
+
+        :param player: The player the announcement is played on.
+        :param render: The announcement audio being rendered.
+        :return: Whether the announcement was scheduled over the queue's stream.
+        """
+        queue = self.get_active_queue(player)
+        if queue is None:
+            return False
+        pcm_format = self.mass.streams.program_bus_format(queue.queue_id)
+        if pcm_format is None:
+            return False
+        duration = await render.wait_finished()
+        if not duration:
+            raise PlayerCommandFailed(
+                "The announcement audio is not available, so it can not be mixed "
+                "into the queue's stream."
+            )
+        pcm = await self._render_overlay_pcm(render, pcm_format)
+        if not pcm:
+            return False
+        if not self.mass.streams.schedule_overlay(
+            queue.queue_id, pcm, label=ANNOUNCEMENT_OVERLAY_LABEL
+        ):
+            return False
+        self.logger.info(
+            "Announcement to player %s - mixing %.1fs over the queue's stream",
+            player.state.name,
+            duration,
+        )
+        return True
+
+    async def _render_overlay_pcm(
+        self, render: AnnouncementRender, pcm_format: AudioFormat
+    ) -> bytes:
+        """
+        Return the announcement audio in the format the queue's stream is produced in.
+
+        :param render: The announcement audio being rendered.
+        :param pcm_format: PCM format of the queue's flow stream.
+        """
+        pcm = bytearray()
+        try:
+            async for chunk in render.get_stream(pcm_format):
+                pcm.extend(chunk)
+        except AudioError as err:
+            # the clip is still there for the device route, so fall back instead of failing
+            self.logger.warning("Could not convert the announcement to the stream format: %s", err)
+            return b""
+        return bytes(pcm)
 
     def _native_route_ignores_wanted_volume(
         self, player: Player, announce_player: Player, volume_level: int | None

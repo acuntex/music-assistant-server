@@ -79,6 +79,7 @@ from music_assistant.controllers.streams.announcements import (
 )
 from music_assistant.controllers.streams.audio import (
     StreamsAudio,
+    _FlowProgramBus,
     overlay_active,
     overlay_mixed_in,
 )
@@ -98,6 +99,7 @@ from music_assistant.controllers.streams.constants import (
     DEFAULT_VOLUME_NORMALIZATION_MODE,
     FLOW_STREAM_MAX_LEAD_OUT_SECONDS,
     ICY_WRITE_SIZE,
+    LEAD_MIN_LEAD_SECONDS,
     OUTCOME_ONLY_NORMALIZATION_MODES,
     BufferSize,
     PacingProfile,
@@ -383,6 +385,10 @@ class StreamsController(CoreController):
         # owners (e.g. a plugin) that require flow mode for a queue, by queue id
         self._flow_mode_owners: dict[str, set[str]] = {}
         self._boundary_mix_owners: dict[str, set[str]] = {}
+        # the program bus of every live flow session, by queue id, and the owners that
+        # require the queue's flow stream to keep mixing programs (e.g. a plugin)
+        self._program_buses: dict[str, _FlowProgramBus] = {}
+        self._program_bus_owners: dict[str, set[str]] = {}
 
     @property
     def audio_analysis(self) -> AudioAnalysisController:
@@ -581,6 +587,108 @@ class StreamsController(CoreController):
         """
         player = self.mass.players.get_player(queue_id)
         return player is not None and (player.flow_mode or player.supports_gapless)
+
+    def set_program_bus_required(self, queue_id: str, owner: str, required: bool) -> None:
+        """
+        Require (or release) that the queue's flow stream keeps mixing programs.
+
+        A plugin that wants its own audio heard over the queue's stream claims this for
+        the queues it is active on. The claim only turns anything on together with the
+        streams program bus setting, so releasing it restores the old behaviour.
+
+        :param queue_id: Queue whose flow stream must mix programs.
+        :param owner: Identifier of the requester, e.g. a provider instance id.
+        :param required: True to require it, False to release this owner's claim.
+        """
+        self._set_required(self._program_bus_owners, queue_id, owner, required)
+
+    def program_bus_required(self, queue_id: str) -> bool:
+        """
+        Return whether any owner requires the queue's flow stream to mix programs.
+
+        :param queue_id: Queue to check.
+        """
+        return queue_id in self._program_bus_owners
+
+    def register_program_bus(self, queue_id: str, program_bus: _FlowProgramBus) -> None:
+        """
+        Publish the program bus of a flow session that just started for the queue.
+
+        :param queue_id: Queue the session streams.
+        :param program_bus: The session's program bus.
+        """
+        self._program_buses[queue_id] = program_bus
+
+    def release_program_bus(self, queue_id: str, program_bus: _FlowProgramBus) -> None:
+        """
+        Withdraw the program bus of a flow session of the queue that ended.
+
+        A session that was superseded by a newer one must not take that session's bus
+        with it, so only the bus that is still published is released.
+
+        :param queue_id: Queue the session streamed.
+        :param program_bus: The session's program bus.
+        """
+        if self._program_buses.get(queue_id) is program_bus:
+            del self._program_buses[queue_id]
+
+    def program_bus_active(self, queue_id: str) -> bool:
+        """
+        Return whether the queue has a flow session that can mix a program right now.
+
+        :param queue_id: Queue to check.
+        """
+        return queue_id in self._program_buses
+
+    def program_bus_format(self, queue_id: str) -> AudioFormat | None:
+        """
+        Return the PCM format a program for the queue has to be delivered in.
+
+        :param queue_id: Queue to check.
+        :return: The PCM format of the queue's live flow session, or None without one.
+        """
+        if (program_bus := self._program_buses.get(queue_id)) is None:
+            return None
+        return program_bus.pcm_format
+
+    def schedule_overlay(self, queue_id: str, pcm: bytes, *, label: str) -> bool:
+        """
+        Mix a short program into the queue's live flow stream, a moment from now.
+
+        The program is placed far enough ahead of what the session already produced for
+        the player to reach the stream in time; the bus moves it forward itself when it
+        does not. Nothing is scheduled while the queue has no live flow session.
+
+        :param queue_id: Queue whose stream the program is heard over.
+        :param pcm: The program's audio, in the format the session produces
+            (see program_bus_format).
+        :param label: Name of the program, for the log.
+        :return: Whether the program was scheduled.
+        """
+        if (program_bus := self._program_buses.get(queue_id)) is None:
+            self.logger.info(
+                "No flow stream is mixing programs for queue %s - %s can not be mixed in",
+                queue_id,
+                label,
+            )
+            return False
+        anchor = program_bus.produced_frames + int(
+            LEAD_MIN_LEAD_SECONDS * program_bus.pcm_format.sample_rate
+        )
+        return program_bus.schedule(pcm, anchor, label=label) is not None
+
+    def cancel_overlays(self, queue_id: str, reason: str) -> None:
+        """
+        Drop every program that is still to be heard on the queue's flow stream.
+
+        Runs synchronously: the queue must be able to move on at once, and what was
+        cancelled is never made up for later.
+
+        :param queue_id: Queue whose programs are dropped.
+        :param reason: Why they are dropped, for the log.
+        """
+        if (program_bus := self._program_buses.get(queue_id)) is not None:
+            program_bus.cancel_all(reason)
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Return all Config Entries for this core module (if any)."""
