@@ -108,10 +108,13 @@ from music_assistant.controllers.streams.constants import (
     DEFAULT_VOLUME_NORMALIZATION_MODE,
     HLS_RADIO_INPUT_BURST,
     ICY_PLACEHOLDER_IMAGE_URLS,
+    MAX_LEAD_OVERLAP,
     MIN_VOICE_OVER_DURATION,
     NO_TRACK_MATCH_EXPIRATION,
     NORMALIZATION_LIMITER_CEILING_DB,
     OUTCOME_ONLY_NORMALIZATION_MODES,
+    PRE_OVERLAP_ATTR,
+    PRE_OVERLAP_FROM_ATTR,
     STREAM_SLOT_MATCH_TIMEOUT,
     STREAM_SLOT_PLAYBACK_WAIT_TIMEOUT,
     STREAM_SLOT_WAIT_TIMEOUT,
@@ -2074,6 +2077,13 @@ class StreamsAudio:
             # skip crossfade if buffer would be too small to be meaningful
             if crossfade_buffer_duration < MIN_CROSSFADE_DURATION:
                 crossfade_buffer_duration = 0
+            if self.mass.streams.boundary_mix_required(queue.queue_id):
+                # a break may start over this item's tail: hold enough of it back for that,
+                # but never more than half the track
+                widened = max(crossfade_buffer_duration, MAX_LEAD_OVERLAP + VOICE_OVER_RAMP)
+                if streamdetails.duration:
+                    widened = min(widened, streamdetails.duration / 2)
+                crossfade_buffer_duration = widened
         # Ensure crossfade buffer size is aligned to frame boundaries
         # Frame size = bytes_per_sample * channels
         bytes_per_sample = pcm_format.bit_depth // 8
@@ -2093,6 +2103,19 @@ class StreamsAudio:
             handoff = asyncio.Event()
             claimed_for = tail_overlap.next_queue_item_id
             self._crossfade_pending[queue.queue_id] = (claimed_for, handoff)
+        else:
+            # a clip that starts over this item's tail needs its handoff claimed just as
+            # early: a gapless player that fetches its url now would otherwise play the
+            # head itself and then hear it again under this track
+            early_next = self.mass.player_queues.get_next_item(
+                queue.queue_id, queue_item.queue_item_id
+            )
+            if early_next is not None and (
+                self._planned_lead(early_next, queue_item.queue_item_id) is not None
+            ):
+                handoff = asyncio.Event()
+                claimed_for = early_next.queue_item_id
+                self._crossfade_pending[queue.queue_id] = (claimed_for, handoff)
 
         # pin the body to DYNAMIC when the intro was baked DYNAMIC,
         # else a late measurement flips it and causes a volume jump
@@ -2216,13 +2239,14 @@ class StreamsAudio:
         transition_mode = CrossfadeMode.DISABLED
         fade_in_buffer_duration = 0.0
         fade_in_playback_speed = 1.0
+        lead_seconds = self._planned_lead(next_queue_item, queue_item.queue_item_id)
         # a fade needs enough of the outgoing track to overlap with; a holdback that
         # armed late (or not at all) leaves less than that
         min_fade_out_size = int(
             pcm_format.pcm_sample_size
             * (
                 MIN_VOICE_OVER_DURATION
-                if crossfade_mode == CrossfadeMode.VOICE_OVER
+                if lead_seconds is not None or crossfade_mode == CrossfadeMode.VOICE_OVER
                 else MIN_CROSSFADE_DURATION
             )
         )
@@ -2281,10 +2305,11 @@ class StreamsAudio:
                     del tail_window[:played_out]
                     transition_mode, fade_in_buffer_duration = self._select_buffered_crossfade(
                         next_queue_item.streamdetails,
-                        crossfade_mode,
+                        CrossfadeMode.VOICE_OVER if lead_seconds is not None else crossfade_mode,
                         standard_crossfade_duration,
                         fade_out_seconds=len(tail_window) / pcm_format.pcm_sample_size,
                         playback_speed=fade_in_playback_speed,
+                        lead_seconds=lead_seconds,
                     )
                     crossfade_allowed = transition_mode != CrossfadeMode.DISABLED
             if not crossfade_allowed:
@@ -2314,6 +2339,7 @@ class StreamsAudio:
                         mode=transition_mode,
                         fade_out_data=fade_out_data,
                         fade_in_bytes_len=fade_in_buffer_size,
+                        lead=lead_seconds is not None,
                     )
                     # the mixer degrades to a standard fade when the smart one cannot be planned
                     applied_mode = (
@@ -2730,6 +2756,13 @@ class StreamsAudio:
                     # skip crossfade if buffer would be too small to be meaningful
                     if crossfade_buffer_duration < MIN_CROSSFADE_DURATION:
                         crossfade_buffer_duration = 0
+                if tail_overlap is None and self.mass.streams.boundary_mix_required(queue.queue_id):
+                    # a break may start over this track's tail, and that plan only exists
+                    # later: hold back enough for it, but never more than half the track
+                    widened = max(crossfade_buffer_duration, MAX_LEAD_OVERLAP + VOICE_OVER_RAMP)
+                    if queue_track.streamdetails.duration:
+                        widened = min(widened, queue_track.streamdetails.duration / 2)
+                    crossfade_buffer_duration = widened
                 # Ensure crossfade buffer size is aligned to frame boundaries
                 # Frame size = bytes_per_sample * channels
                 bytes_per_sample = pcm_format.bit_depth // 8
@@ -2756,12 +2789,22 @@ class StreamsAudio:
                     # a tail overlap the outgoing item declared plays into the item it was
                     # planned against, whatever the queue's crossfade setting
                     requested_mode = incoming_mode
+                    lead_seconds: float | None = None
                     if (declared := last_streamdetails.tail_overlap) is not None:
                         requested_mode = (
                             CrossfadeMode.VOICE_OVER
                             if queue_track.queue_item_id == declared.next_queue_item_id
                             else CrossfadeMode.DISABLED
                         )
+                    elif (
+                        lead_seconds := self._planned_lead(
+                            queue_track,
+                            outgoing_queue_track.queue_item_id
+                            if outgoing_queue_track is not None
+                            else "",
+                        )
+                    ) is not None:
+                        requested_mode = CrossfadeMode.VOICE_OVER
                     if requested_mode == CrossfadeMode.VOICE_OVER or (
                         crossfade_buffer_size > 0 and requested_mode != CrossfadeMode.DISABLED
                     ):
@@ -2794,6 +2837,7 @@ class StreamsAudio:
                             standard_crossfade_duration,
                             fade_out_seconds=len(last_fadeout_part) / pcm_sample_size,
                             playback_speed=track_playback_speed,
+                            lead_seconds=lead_seconds,
                         )
                     if transition_mode == CrossfadeMode.DISABLED:
                         # nothing to fade into: flush the held-back tail of the previous track
@@ -2826,6 +2870,7 @@ class StreamsAudio:
                             mode=transition_mode,
                             fade_out_data=last_fadeout_part,
                             fade_in_bytes_len=incoming_crossfade_size,
+                            lead=lead_seconds is not None,
                         )
                         build_seconds = asyncio.get_event_loop().time() - build_started
                         timing_info = crossfade_smart_fade.timing_info
@@ -2874,7 +2919,9 @@ class StreamsAudio:
                 # from the streamdetails before it releases it, which the duration writeback
                 # must see
                 source_buffer: AudioBuffer | None = None
-                holding_back = item_crossfade_mode != CrossfadeMode.DISABLED
+                holding_back = item_crossfade_mode != CrossfadeMode.DISABLED or (
+                    self.mass.streams.boundary_mix_required(queue.queue_id)
+                )
 
                 item_stream = await incoming_prefetcher.take(queue_track, int(raw_seek_position))
                 prefetched_size = incoming_prefetcher.collected_at_handover if item_stream else 0
@@ -3175,11 +3222,19 @@ class StreamsAudio:
                     last_fadeout_part = b""
                 # a fade needs enough of the outgoing track to overlap with; a holdback that
                 # armed late (or not at all) leaves less than that
+                # a break that starts over this track's tail needs its own, shorter threshold
+                lead_planned = self._planned_lead(
+                    self.mass.player_queues.get_next_item(
+                        queue.queue_id, queue_track.queue_item_id
+                    ),
+                    queue_track.queue_item_id,
+                )
                 min_fade_out_size = int(
                     pcm_sample_size
                     * (
                         MIN_VOICE_OVER_DURATION
-                        if item_crossfade_mode == CrossfadeMode.VOICE_OVER
+                        if lead_planned is not None
+                        or item_crossfade_mode == CrossfadeMode.VOICE_OVER
                         else MIN_CROSSFADE_DURATION
                     )
                 )
@@ -3200,7 +3255,7 @@ class StreamsAudio:
                             await asyncio.sleep(0)
                         bytes_written += len(remaining_bytes)
                     del remaining_bytes
-                elif item_crossfade_mode != CrossfadeMode.DISABLED and crossfade_buffer:
+                elif crossfade_buffer:
                     bytes_written += len(crossfade_buffer)
                     for pcm_slice in iter_pcm_slices(bytes(crossfade_buffer), pcm_format, 1000):
                         yield pcm_slice
@@ -3323,6 +3378,23 @@ class StreamsAudio:
             for fd in pass_fds:
                 os.close(fd)
 
+    @staticmethod
+    def _planned_lead(queue_item: QueueItem | None, outgoing_item_id: str) -> float | None:
+        """
+        Return the lead a clip declares over the given outgoing item, if any.
+
+        :param queue_item: The incoming queue item, which may declare a lead.
+        :param outgoing_item_id: Queue item the lead was planned against.
+        """
+        if queue_item is None:
+            return None
+        declared = queue_item.extra_attributes.get(PRE_OVERLAP_ATTR)
+        if not isinstance(declared, (int, float)) or declared <= 0:
+            return None
+        if queue_item.extra_attributes.get(PRE_OVERLAP_FROM_ATTR) != outgoing_item_id:
+            return None
+        return float(declared)
+
     def crossfade_allowed(
         self,
         queue_item: QueueItem,
@@ -3362,6 +3434,25 @@ class StreamsAudio:
                 )
                 return False
             return True
+        if (
+            self._planned_lead(
+                next_queue_item
+                or self.mass.player_queues.get_next_item(
+                    queue_item.queue_id, queue_item.queue_item_id
+                ),
+                queue_item.queue_item_id,
+            )
+            is not None
+        ):
+            # a declared lead plays this item's tail under the clip that starts: it is kept
+            # when this item's stream holds its tail back, which the smart fade and flow
+            # streams do and the plain item stream does not
+            if queue_item.media_type != MediaType.TRACK:
+                self.logger.debug("Skipping the lead overlap: current item is not a track")
+                return False
+            return self._may_mix_across_sample_rates(
+                player_id, flow_mode, sample_rate, next_sample_rate
+            )
         if crossfade_mode == CrossfadeMode.DISABLED:
             return False
         if not (self.mass.player_queues.get(queue_item.queue_id)):
@@ -5123,6 +5214,7 @@ class StreamsAudio:
         standard_crossfade_duration: int,
         fade_out_seconds: float,
         playback_speed: float = 1.0,
+        lead_seconds: float | None = None,
     ) -> tuple[CrossfadeMode, float]:
         """
         Select the crossfade this boundary can carry.
@@ -5137,6 +5229,8 @@ class StreamsAudio:
         :param standard_crossfade_duration: Configured standard overlap in seconds.
         :param fade_out_seconds: Held-back outgoing tail in seconds.
         :param playback_speed: Incoming track playback-speed multiplier.
+        :param lead_seconds: Declared lead of the incoming item over the outgoing tail, if any.
+            The window is then exactly that lead, without the ramp a trailing voice needs.
         :return: Effective mode and fade-in duration in seconds; for a voice over the
             fade-in also covers the ramp back to full level after the window.
         """
@@ -5161,7 +5255,10 @@ class StreamsAudio:
         # it arrives while the blend plays. The tail we held back is what bounds it.
         voice_over = crossfade_mode == CrossfadeMode.VOICE_OVER
         window = fade_out_seconds
-        if not voice_over:
+        if lead_seconds is not None:
+            # a leading voice takes exactly its declared lead of the outgoing tail
+            window = min(lead_seconds, window)
+        elif not voice_over:
             window = min(
                 SMART_CROSSFADE_DURATION
                 if crossfade_mode == CrossfadeMode.SMART_CROSSFADE
@@ -5189,7 +5286,7 @@ class StreamsAudio:
             streamdetails.uri,
         )
         if voice_over:
-            return crossfade_mode, window + VOICE_OVER_RAMP
+            return crossfade_mode, window if lead_seconds is not None else window + VOICE_OVER_RAMP
         return crossfade_mode, window
 
     async def _resolve_media_stream_source(

@@ -93,7 +93,7 @@ class AIRadioQueueDJMixin:
                         armed.station_id = previous.station_id
                         if armed.station_id:
                             self.mass.streams.set_boundary_mix_required(
-                                queue_id, self.instance_id, self._host_posts(host_id)
+                                queue_id, self.instance_id, self._host_mixes_boundary(host_id)
                             )
                 await self._write_queue_dj()
             # stale clips carry the old host's persona, so they must go before a replan
@@ -207,10 +207,10 @@ class AIRadioQueueDJMixin:
                 "Not arming the DJ for show %s: host %s no longer exists", station_id, host_id
             )
             return
-        if self._host_posts(host_id):
-            # the show's breaks carry over the next track: the server mixes them between
-            # the item streams of a player that plays gapless and streams any other player
-            # in flow mode, decided at the play start this arm precedes
+        if self._host_mixes_boundary(host_id):
+            # the show's breaks straddle a boundary: the server mixes them between the item
+            # streams of a player that plays gapless and streams any other player in flow
+            # mode, decided at the play start this arm precedes
             self.mass.streams.set_boundary_mix_required(queue_id, self.instance_id, True)
         try:
             await self.set_queue_dj(queue_id, host_id)
@@ -764,11 +764,19 @@ class AIRadioQueueDJMixin:
             "media_item": None,
         }
 
-    def _host_posts(self, host_id: str) -> bool:
-        """Return whether any section of the host lets its break carry over the next track."""
+    def _refresh_boundary_mix_claims(self) -> None:
+        """Re-evaluate which armed queues need their item boundaries mixed."""
+        for queue_id, state in list(self._dj_queues.items()):
+            self.mass.streams.set_boundary_mix_required(
+                queue_id, self.instance_id, self._host_mixes_boundary(state.host_id)
+            )
+
+    def _host_mixes_boundary(self, host_id: str) -> bool:
+        """Return whether any section of the host lets its break straddle a track boundary."""
         host = self._hosts.get(host_id) or {}
         return any(
             bool(self._sections.get(str(section_id), {}).get("allow_post", False))
+            or bool(self._sections.get(str(section_id), {}).get("allow_pre", False))
             for section_id in host.get("section_ids", [])
         )
 

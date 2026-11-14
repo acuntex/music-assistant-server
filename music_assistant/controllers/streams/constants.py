@@ -202,6 +202,14 @@ MIN_VOICE_OVER_DURATION: Final[float] = 1.0
 # Seconds over which the music under a voice over ramps back to full level once the
 # voice has ended.
 VOICE_OVER_RAMP: Final[float] = 0.4
+# Furthest a break may reach back over the running track's tail (a "pre"). Providers that
+# plan one publish it on the clip queue item, but the tail of the track before it has to be
+# held back before that plan exists, so the hold is armed for this much.
+MAX_LEAD_OVERLAP: Final[float] = 12.0
+# QueueItem.extra_attributes keys a provider uses to declare that a clip starts over the
+# tail of the item before it: the seconds, and the item id it was planned against.
+PRE_OVERLAP_ATTR: Final[str] = "ai_radio_pre_overlap"
+PRE_OVERLAP_FROM_ATTR: Final[str] = "ai_radio_pre_from"
 
 # Maximum wait for a provider source-stream slot before a speculative attempt gives up.
 STREAM_SLOT_WAIT_TIMEOUT: Final[float] = 5.0

@@ -2065,3 +2065,23 @@ async def test_player_removed_emits_a_queue_dj_hint(tmp_path: Path) -> None:
 
     assert "queue-1" not in dummy._dj_queues
     assert dummy.provider_events == [{"event": EVENT_QUEUE_DJ_UPDATED}]
+
+
+def test_a_section_edit_rearms_the_boundary_claim(tmp_path: Path) -> None:
+    """A section that opts into pre or post flips the claim of the queues its host armed."""
+    dj = _dj_harness(tmp_path)
+    dj._sections["talk"] = {"id": "talk"}
+    dj._hosts["amy"]["section_ids"] = ["talk"]
+    dj._arm_dj_state("q1", "amy")
+
+    dj._refresh_boundary_mix_claims()
+    assert dj.mass.boundary_mix_calls[-1] == ("q1", False)
+
+    dj._sections["talk"]["allow_pre"] = True
+    dj._refresh_boundary_mix_claims()
+    assert dj.mass.boundary_mix_calls[-1] == ("q1", True)
+
+    dj._sections["talk"]["allow_pre"] = False
+    dj._sections["talk"]["allow_post"] = True
+    dj._refresh_boundary_mix_claims()
+    assert dj.mass.boundary_mix_calls[-1] == ("q1", True)

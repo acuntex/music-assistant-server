@@ -14,7 +14,12 @@ from music_assistant_models.streamdetails import TailOverlap
 
 from music_assistant.controllers.streams import audio as audio_module
 from music_assistant.controllers.streams.audio import StreamsAudio
-from music_assistant.controllers.streams.constants import MIN_VOICE_OVER_DURATION, VOICE_OVER_RAMP
+from music_assistant.controllers.streams.constants import (
+    MIN_VOICE_OVER_DURATION,
+    PRE_OVERLAP_ATTR,
+    PRE_OVERLAP_FROM_ATTR,
+    VOICE_OVER_RAMP,
+)
 from music_assistant.controllers.streams.smart_fades.fades import VoiceOverFade
 from tests.controllers.streams.test_crossfade_transition import (
     STANDARD_CROSSFADE_DURATION,
@@ -385,3 +390,29 @@ async def test_clip_cuts_to_the_track_when_its_audio_is_late(
     assert bytes(output) == bytes([0x10]) * CLIP_SECONDS * SAMPLE_SIZE + (
         bytes([0x40]) * TRACK_SECONDS * SAMPLE_SIZE
     )
+
+
+async def test_a_break_starts_over_the_tail_of_the_track_before_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clip declaring a lead is mixed over the outgoing tail, which is ducked under it."""
+    lead = 4.0
+    track = _track("item-1", "Track")
+    track.streamdetails.duration = TRACK_SECONDS
+    clip = _queue_item("item-2", "Clip", duration=CLIP_SECONDS)
+    clip.media_type = MediaType.SOUND_EFFECT
+    clip.streamdetails.tail_overlap = None
+    clip.extra_attributes[PRE_OVERLAP_ATTR] = lead
+    clip.extra_attributes[PRE_OVERLAP_FROM_ATTR] = track.queue_item_id
+    audio, queue, _mass = _voice_over_audio(
+        monkeypatch, next_item=clip, load_next=[clip, QueueEmpty]
+    )
+    _install_item_streams(monkeypatch, audio)
+
+    await _drain(_flow(audio, queue, track))
+
+    kwargs = cast("Any", audio.smart_fades_mixer.build).await_args.kwargs
+    assert kwargs["mode"] == CrossfadeMode.VOICE_OVER
+    assert kwargs["lead"] is True
+    # the window is exactly the declared lead, without the ramp a trailing voice adds
+    assert kwargs["fade_in_bytes_len"] == int(lead * SAMPLE_SIZE)

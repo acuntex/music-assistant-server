@@ -2184,6 +2184,8 @@ def _single_item_handler(
     controller.audio = audio
     controller._open_item_streams = {}
     controller._ended_item_streams = {}
+    controller._flow_mode_owners = {}
+    controller._boundary_mix_owners = {}
     controller.logger = MagicMock()
     controller._log_request = MagicMock()
     controller.get_crossfade_mode = MagicMock(return_value=CrossfadeMode.SMART_CROSSFADE)

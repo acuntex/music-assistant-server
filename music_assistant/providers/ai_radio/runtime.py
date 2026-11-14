@@ -37,6 +37,7 @@ from music_assistant.helpers.uri import create_uri
 from .constants import (
     AI_QUERY_TIMEOUT_SECONDS,
     ATTR_ALLOW_POST,
+    ATTR_ALLOW_PRE,
     ATTR_HOST_ID,
     ATTR_MAX_CHARS,
     ATTR_PROMPT,
@@ -365,6 +366,7 @@ class AIRadioRuntimeMixin:
                     web_search_mode=self._resolve_web_search_mode(section, section_id),
                     weather_required=weather_required,
                     allow_post=bool(section.get("allow_post", False)),
+                    allow_pre=bool(section.get("allow_pre", False)),
                     history_events=[(section_id, slot_event(slot))],
                 )
             )
@@ -431,6 +433,10 @@ class AIRadioRuntimeMixin:
             bool(section_by_id.get(section_id, {}).get("allow_post", False))
             for section_id in section_ids
         )
+        all_allow_pre = all(
+            bool(section_by_id.get(section_id, {}).get("allow_pre", False))
+            for section_id in section_ids
+        )
         for index, section_id in enumerate(section_ids, start=1):
             section = section_by_id.get(section_id, {})
             section_name = self._resolve_section_name(section, section_id)
@@ -472,6 +478,7 @@ class AIRadioRuntimeMixin:
             web_search_mode=max_web_mode,
             weather_required=all_weather_required,
             allow_post=all_allow_post,
+            allow_pre=all_allow_pre,
             history_events=history_events,
         )
 
@@ -517,6 +524,7 @@ class AIRadioRuntimeMixin:
                 ATTR_WEB_SEARCH_MODE: section.web_search_mode,
                 ATTR_WEATHER_REQUIRED: section.weather_required,
                 ATTR_ALLOW_POST: section.allow_post,
+                ATTR_ALLOW_PRE: section.allow_pre,
             }
         )
         return queue_item

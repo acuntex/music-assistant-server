@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from music_assistant_models.enums import (
     ContentType,
+    CrossfadeMode,
     MediaType,
     PlaybackState,
     StreamType,
@@ -47,8 +48,11 @@ from music_assistant.helpers.tts import TTSLanguageNotSupportedError
 from music_assistant.models.plugin import PluginProvider, TTSEngine
 from music_assistant.providers.ai_radio.constants import (
     ATTR_ALLOW_POST,
+    ATTR_ALLOW_PRE,
     ATTR_HOST_ID,
     ATTR_MAX_CHARS,
+    ATTR_PRE_FROM,
+    ATTR_PRE_OVERLAP,
     ATTR_PROMPT,
     ATTR_QUEUE_DJ,
     ATTR_RENDERED_TEXT,
@@ -63,6 +67,7 @@ from music_assistant.providers.ai_radio.constants import (
     FALLBACK_TRACK_SECONDS,
     MIN_LOUDNESS_REFERENCE_SECONDS,
     NO_WEATHER_DATA_INSTRUCTION,
+    TALK_OVER_MAX_PRE,
     TTS_CLIP_PCM_FORMAT,
     TTS_PEAK_CEILING_DB,
     TTS_SPEECHNORM_FILTER,
@@ -232,6 +237,11 @@ def _attach_queues(renderer: DummyRenderer, queues: dict[str, list[QueueItem]]) 
                     if item.queue_item_id == queue_item_id
                 ),
                 None,
+            ),
+            get_item=lambda queue_id, index: (
+                queues.get(queue_id, [])[index]
+                if 0 <= index < len(queues.get(queue_id, []))
+                else None
             ),
             signal_update=lambda _queue_id, items_changed=False: signals.append(items_changed),
         ),
@@ -1527,6 +1537,7 @@ def _attach_post(
     boundary_mix_required: bool = False,
     mixes_item_boundaries: bool = False,
     load_next: QueueItem | Exception | None = None,
+    crossfade_mode: CrossfadeMode = CrossfadeMode.STANDARD_CROSSFADE,
 ) -> tuple[AsyncMock, AsyncMock]:
     """
     Wire the next queue item, how the queue mixes it, its stored analysis and its lyrics.
@@ -1554,6 +1565,7 @@ def _attach_post(
     mass.streams.flow_mode_required = MagicMock(return_value=flow_mode_required)
     mass.streams.boundary_mix_required = MagicMock(return_value=boundary_mix_required)
     mass.streams.mixes_item_boundaries = MagicMock(return_value=mixes_item_boundaries)
+    mass.streams.get_crossfade_mode = MagicMock(return_value=crossfade_mode)
     get_vocal_onset = AsyncMock(return_value=analysis_onset)
     mass.streams.audio_analysis = SimpleNamespace(get_vocal_onset=get_vocal_onset)
     get_track_lyrics = AsyncMock(return_value=lyrics)
@@ -2266,3 +2278,61 @@ async def test_the_timestamp_counts_real_seconds_across_a_clock_change(
     await asyncio.gather(*started.values())
 
     assert expected in renderer.llm_prompts[0]
+
+
+def test_the_pre_takes_the_part_of_the_break_the_post_leaves() -> None:
+    """A pre carries the part of the break the post does not, capped and never tiny."""
+    renderer = DummyRenderer()
+    song = _song(0)
+    clip = _dj_clip_item("djlive", 1)
+    _attach_queue(renderer, [song, clip])
+    _attach_post(renderer, None)
+
+    assert renderer._plan_pre(clip, 8.0, None) == (8.0, song.queue_item_id)
+    assert renderer._plan_pre(
+        clip,
+        8.0,
+        TailOverlap(duration=4.0, next_queue_item_id="qi_track"),
+    ) == (4.0, song.queue_item_id)
+    assert renderer._plan_pre(clip, 45.0, None) == (TALK_OVER_MAX_PRE, song.queue_item_id)
+    assert renderer._plan_pre(clip, 0.4, None) == (None, None)
+
+
+def test_the_pre_needs_a_track_before_the_clip() -> None:
+    """An opening clip has nothing to play over, so no pre is planned for it."""
+    renderer = DummyRenderer()
+    clip = _dj_clip_item("djlive", 1)
+    _attach_queue(renderer, [clip])
+    _attach_post(renderer, None)
+
+    assert renderer._plan_pre(clip, 8.0, None) == (None, None)
+
+
+def test_no_pre_is_planned_on_a_queue_that_plays_without_crossfade() -> None:
+    """Nothing of the previous track is held back without a crossfade, so no head is planned."""
+    renderer = DummyRenderer()
+    song = _song(0)
+    clip = _dj_clip_item("djlive", 1)
+    _attach_queue(renderer, [song, clip])
+    _attach_post(renderer, None, crossfade_mode=CrossfadeMode.DISABLED)
+
+    assert renderer._plan_pre(clip, 8.0, None) == (None, None)
+
+
+async def test_a_pre_caps_the_post_at_half_the_break() -> None:
+    """With both halves allowed the break splits at the boundary instead of keeping a head."""
+    renderer = DummyRenderer()
+    song = _song(0)
+    clip = _posting_clip_item()
+    clip.extra_attributes[ATTR_ALLOW_PRE] = True
+    _attach_queue(renderer, [song, clip])
+    _attach_post(renderer, _track_item(), analysis_onset=60.0)
+
+    streamdetails = await renderer.get_stream_details("sess_001", MediaType.SOUND_EFFECT)
+
+    assert streamdetails.duration is not None
+    assert streamdetails.tail_overlap is not None
+    half = streamdetails.duration / 2
+    assert streamdetails.tail_overlap.duration == pytest.approx(half, abs=0.1)
+    assert clip.extra_attributes[ATTR_PRE_OVERLAP] == pytest.approx(half, abs=0.1)
+    assert clip.extra_attributes[ATTR_PRE_FROM] == song.queue_item_id

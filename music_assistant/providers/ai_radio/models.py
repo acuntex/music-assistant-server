@@ -70,6 +70,9 @@ class PlannedSection:
     weather_required: bool = False
     # when true, the section's break may be split so its tail plays over the next record's intro
     allow_post: bool = False
+    # when true, the break may start over the running record's tail (a "pre"); with both on
+    # the break straddles the boundary instead of sitting entirely on one side of it
+    allow_pre: bool = False
     # the guard history events this plan claimed, as (section_id, (song, minute)). a caller
     # that drops the plan can drop these too, so a clip that never aired carries no weight
     history_events: list[tuple[str, tuple[int, float]]] = field(default_factory=list)

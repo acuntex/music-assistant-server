@@ -529,3 +529,29 @@ async def test_a_failed_next_item_load_releases_the_early_claim(
 
     assert not audio.fade_into_pending("queue-1", "item-2")
     assert "queue-1" not in audio._crossfade_pending
+
+
+async def test_a_track_with_a_declared_lead_gets_the_clip_mixed_over_its_tail(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clip that declares a lead is mixed over the outgoing track's tail, which is ducked."""
+    lead = 4.0
+    track = _track("item-1", "Track")
+    track.streamdetails.duration = TRACK_SECONDS
+    clip = _track("item-2", "Clip")
+    clip.media_type = MediaType.SOUND_EFFECT
+    clip.streamdetails.tail_overlap = None
+    clip.extra_attributes = {
+        "ai_radio_pre_overlap": lead,
+        "ai_radio_pre_from": track.queue_item_id,
+    }
+    audio, _mass = _item_audio(monkeypatch, next_item=clip, load_next=[clip])
+    _install_item_streams(monkeypatch, audio)
+
+    await _drain(_request(audio, track, CrossfadeMode.STANDARD_CROSSFADE))
+
+    kwargs = cast("Any", audio.smart_fades_mixer.build).await_args.kwargs
+    assert kwargs["mode"] == CrossfadeMode.VOICE_OVER
+    assert kwargs["lead"] is True
+    # the window is exactly the declared lead, not the queue's crossfade length
+    assert kwargs["fade_in_bytes_len"] == int(lead * SAMPLE_SIZE)

@@ -9,7 +9,7 @@ import sys
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
 from contextlib import aclosing, suppress
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 from music_assistant.constants import VERBOSE_LOG_LEVEL
 from music_assistant.controllers.streams.constants import VOICE_OVER_RAMP
@@ -497,16 +497,24 @@ class StandardCrossFade(SmartFade):
 
 class VoiceOverFade(SmartFade):
     """
-    Play the outgoing item's tail over the start of the incoming track, ducking the track.
+    Play one side of a boundary over the other, ducking the side that is not the voice.
 
-    Used for a tail overlap an item declares (a DJ talking over a song's intro): the tail
-    plays as it is, with the track starting under its last ``overlap`` seconds and
-    returning to full level over ``VOICE_OVER_RAMP`` seconds once it has ended.
+    Used for a declared overlap: with ``duck_side="in"`` the outgoing item's tail plays
+    over the start of the incoming track, which is ducked (a DJ talking over a song's
+    intro). With ``duck_side="out"`` the incoming item starts over the outgoing item's
+    tail, which is ducked from the moment the voice enters (a break that begins over the
+    running song's outro).
     """
 
-    def __init__(self, logger: logging.Logger) -> None:
-        """Initialize VoiceOverFade."""
+    def __init__(self, logger: logging.Logger, duck_side: Literal["in", "out"] = "in") -> None:
+        """
+        Initialize VoiceOverFade.
+
+        :param logger: Logger to use.
+        :param duck_side: "in" to duck the incoming item, "out" to duck the outgoing one.
+        """
         super().__init__(logger)
+        self.duck_side = duck_side
         self.overlap_size: int = 0
         self.blend_in_size: int = 0
 
@@ -519,12 +527,18 @@ class VoiceOverFade(SmartFade):
         """Build the voice over filter chain and assign ``self.timing_info``."""
         fade_out_seconds = fade_out_bytes_len / pcm_format.pcm_sample_size
         fade_in_seconds = fade_in_bytes_len / pcm_format.pcm_sample_size
-        overlap = max(0.0, min(fade_out_seconds, fade_in_seconds - VOICE_OVER_RAMP))
+        lead = self.duck_side == "out"
+        # a leading voice is ramped down inside the overlap, a trailing one needs the extra
+        # window to come back up after it
+        overlap = max(
+            0.0,
+            min(fade_out_seconds, fade_in_seconds if lead else fade_in_seconds - VOICE_OVER_RAMP),
+        )
         # whole frames only, so the byte slices in apply match the filter's timing exactly
         frame_size = (pcm_format.bit_depth // 8) * pcm_format.channels
         self.overlap_size = int(pcm_format.pcm_sample_size * overlap) // frame_size * frame_size
         ramp_size = int(pcm_format.pcm_sample_size * VOICE_OVER_RAMP) // frame_size * frame_size
-        self.blend_in_size = self.overlap_size + ramp_size
+        self.blend_in_size = self.overlap_size if lead else self.overlap_size + ramp_size
         overlap = self.overlap_size / pcm_format.pcm_sample_size
         self.timing_info = CrossfadeTimingInfo(
             pre_crossfade_duration=max(0.0, fade_out_seconds - overlap),
@@ -537,6 +551,7 @@ class VoiceOverFade(SmartFade):
                 logger=self.logger,
                 overlap_seconds=overlap,
                 ramp_seconds=ramp_size / pcm_format.pcm_sample_size,
+                duck_side=self.duck_side,
             ),
         ]
 

@@ -7,6 +7,13 @@ from typing import Any
 from music_assistant_models.enums import ContentType
 from music_assistant_models.media_items import AudioFormat
 
+from music_assistant.controllers.streams.constants import (
+    MAX_LEAD_OVERLAP,
+    MIN_VOICE_OVER_DURATION,
+    PRE_OVERLAP_ATTR,
+    PRE_OVERLAP_FROM_ATTR,
+)
+
 CONF_AI_ENGINE = "ai_engine"
 CONF_TTS_ENGINE = "tts_engine"
 CONF_TTS_LOUDNESS_BOOST = "tts_loudness_boost"
@@ -158,6 +165,15 @@ ATTR_WEATHER_REQUIRED = "ai_radio_weather_required"
 # per-section opt-in: a break from a section that allows it may carry its tail over the
 # next record's intro (a "post")
 ATTR_ALLOW_POST = "ai_radio_allow_post"
+# per-section opt-in: a break from a section that allows it may start over the running
+# record's tail (a "pre"). Together with a post the break straddles the boundary.
+ATTR_ALLOW_PRE = "ai_radio_allow_pre"
+# seconds of the break that play before the boundary, published on the clip for the streams;
+# the keys and the ceilings are shared with the stream controller, so a change cannot drift
+ATTR_PRE_OVERLAP = PRE_OVERLAP_ATTR
+ATTR_PRE_FROM = PRE_OVERLAP_FROM_ATTR
+TALK_OVER_MAX_PRE = MAX_LEAD_OVERLAP
+MIN_PRE_SECONDS = MIN_VOICE_OVER_DURATION
 
 # A post plays the last `overlap` seconds of a break over the next record's intro, with the
 # record ducked under the voice. With a break of B seconds and W seconds of intro before the
