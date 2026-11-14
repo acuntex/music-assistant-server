@@ -278,14 +278,15 @@ with, so the flow is neither restarted nor reopened and no second ffmpeg input i
   `play_index`; `stop` and `pause` leave the clip alone, and a session that ends drops its own
   programs. Nothing is made up for later: the rest of the item plays without the duck.
 - An item's declared lead (the `ai_radio_pre_overlap` queue item attributes) is placed on the same
-  bus, anchored at the item's end. Declared durations are whole-second media estimates and a seek
-  lands a few hundred ms away from them, so the head is not anchored on `duration - seek`: the
-  item's last `lead` is held back from the bus and the head is placed on that tail when the item's
-  stream ends, which puts its end on the frame the item really ended on. The hold is bounded by the
-  lead the provider planned (the player's buffer covers it, the same way it covers the tail the flow
-  holds for a boundary); a head that lost its window can not be held and keeps the anchor it was
-  armed with. Each lead logs `PROGRAM-BUS anchor drift=…ms` with the frame it was placed on, the
-  item's produced end and the end the declared durations gave.
+  bus, anchored at the item's declared end. Declared durations are whole-second media estimates
+  and a seek lands a few hundred ms away from them, so the head is not placed exactly: the frame
+  comes from `duration - seek`, and the residue between that end and the one the item really
+  produced is reported as `PROGRAM-BUS anchor drift=…ms` when the item ends. Nothing of the item
+  is held back for the placement, because a hold longer than the player's buffer starves the
+  player and is heard as the stream standing still with the reported position stepping back; the
+  bus moves a head whose frame is already produced forward (logged as `started late by`) instead
+  of waiting for it. A head whose window is not over when the item ends is dropped, so what is
+  left of it never sounds over the next item.
 - A session that has the bus switched on selects float PCM for the flow (`overlay_active` in
   `select_flow_pcm_format`, i.e. the same path the queue overlay uses): summing a voice over music
   needs the headroom. The choice is made at play start, like every other flow format decision. A

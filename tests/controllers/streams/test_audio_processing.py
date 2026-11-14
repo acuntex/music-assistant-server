@@ -1929,20 +1929,21 @@ async def test_flow_ends_unfinished_when_its_source_is_released(
         assert streamdetails.seconds_streamed == 3
         assert entry.seconds_streamed == 3
         mass.player_queues.queue_buffer_completed.assert_called_once()
-    expected_duration = 300 if source_cancelled else 3
-    assert streamdetails.duration == expected_duration
-    assert queue_track.duration == expected_duration
-    assert entry.duration == (None if source_cancelled else 3)
+    # a source that stopped after 3 s of a 300 s item did not deliver the item, so the
+    # shortfall is not written back as its length - however it ended
+    assert streamdetails.duration == 300
+    assert queue_track.duration == 300
+    assert entry.duration is None
 
 
 @pytest.mark.parametrize(
-    ("released_by_stop", "expected_duration"),
-    [(False, 3), (True, 180)],
+    "released_by_stop",
+    [False, True],
     ids=["clean_source", "source_released_by_a_stop"],
 )
 @pytest.mark.asyncio
 async def test_item_stream_does_not_write_back_a_duration_for_a_released_source(
-    monkeypatch: pytest.MonkeyPatch, released_by_stop: bool, expected_duration: int
+    monkeypatch: pytest.MonkeyPatch, released_by_stop: bool
 ) -> None:
     """A single item whose buffer a stop released keeps its length, as in the flow."""
     mass = MagicMock()
@@ -1996,8 +1997,9 @@ async def test_item_stream_does_not_write_back_a_duration_for_a_released_source(
 
     assert len(chunks) == 3
     assert streamdetails.seconds_streamed == 3
-    assert streamdetails.duration == expected_duration
-    assert queue_item.duration == expected_duration
+    # the 180 s item keeps its length: 3 s written is a source that stopped, not its end
+    assert streamdetails.duration == 180
+    assert queue_item.duration == 180
 
 
 def _manager_context(

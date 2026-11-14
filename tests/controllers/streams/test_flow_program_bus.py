@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import struct
+from collections import deque
 from collections.abc import AsyncGenerator
 from types import SimpleNamespace
 from typing import Any, cast
@@ -28,6 +29,7 @@ from music_assistant.constants import FLOW_MODE_SAMPLE_RATE_SMART
 from music_assistant.controllers.streams.audio import (
     StreamsAudio,
     _FlowProgramBus,
+    _IncomingFadePrefetcher,
     _ProgramLead,
 )
 from music_assistant.controllers.streams.constants import (
@@ -381,11 +383,12 @@ async def test_a_non_mixable_flow_leaves_the_head_to_the_boundary_fade(
     assert len(output) == int((LEAD_TRACK_SECONDS + LEAD_CLIP_SECONDS) * SAMPLE_SIZE)
 
 
-def test_a_lead_whose_end_is_taken_by_a_program_is_not_placed() -> None:
-    """A head that can not end on the item's end is left to the clip instead of cut short."""
+def test_a_lead_whose_window_is_taken_is_not_placed() -> None:
+    """A head moved out of its own window is left to the clip instead of cut short."""
     logger = MagicMock()
-    bus = _bus()
-    bus.feed(_music(0.5))
+    bus = _FlowProgramBus(TEST_PCM_FORMAT, logger)
+    # a program covers the frame the head is anchored on and runs past the item's end
+    assert bus.schedule(_voice(4.0), int(9.0 * SECOND), label="announcement") is not None
     lead = _ProgramLead(
         bus,
         logger,
@@ -393,21 +396,16 @@ def test_a_lead_whose_end_is_taken_by_a_program_is_not_placed() -> None:
         label="lead:clip",
         declared_anchor=10 * SECOND,
     )
-    assert lead.arm() == 10 * SECOND
-    # the item's last seconds are held back for its own end ...
-    for _ in range(10):
-        bus.feed(lead.feed(_music(1.0)))
-    assert bus.produced_frames == 8.5 * SECOND
-    # ... when another program takes the window the head would move onto
-    assert bus.schedule(_voice(1.0), bus.produced_frames, label="announcement") is not None
 
-    tail = lead.finish()
-
-    assert not lead.placed
+    assert lead.arm() is None
     assert lead.anchor_report is None
-    assert sum(len(chunk) for chunk in tail) == int(LEAD * SAMPLE_SIZE)
     # the head is not on the bus; only the announcement is
     assert bus.active
+    assert any(
+        call.args[0]
+        == "PROGRAM-BUS schedule label=%s dropped: its window is taken by another program"
+        for call in logger.debug.call_args_list
+    )
 
 
 async def test_the_program_bus_is_read_once_per_session(
@@ -643,11 +641,63 @@ def _capture_leads(monkeypatch: pytest.MonkeyPatch, audio: StreamsAudio) -> list
 DRIFT_REAL_SECONDS = LEAD_TRACK_SECONDS + 0.219
 
 
-async def test_the_head_ends_where_the_item_really_ends(
+async def test_the_lead_never_holds_the_item_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A head is placed on the bus only: the item runs on to its last frame, without a gap."""
+    audio, queue, mass, _opened, track = _lead_flow(monkeypatch, program_bus=True)
+    leads = _capture_leads(monkeypatch, audio)
+    published: list[_FlowProgramBus] = []
+    mass.streams.register_program_bus.side_effect = lambda _queue_id, bus: published.append(bus)
+    frame_size = SAMPLE_SIZE // SECOND
+    track_frames = LEAD_TRACK_SECONDS * SECOND
+    track_bytes = track_frames * frame_size
+    produced_at_end: dict[str, int] = {}
+
+    async def _item_stream(
+        queue_item: SimpleNamespace, *_args: object, **kwargs: object
+    ) -> AsyncGenerator[bytes]:
+        marker = 0x10 if queue_item.queue_item_id == "item-1" else 0x40
+        remaining = queue_item.streamdetails.duration - int(
+            cast("float", kwargs.get("seek_position", 0))
+        )
+        for _ in range(remaining):
+            yield bytes([marker]) * SAMPLE_SIZE
+        if queue_item.queue_item_id == "item-1":
+            # the source is exhausted here: nothing of the item may still wait in the bus
+            produced_at_end["item-1"] = published[0].produced_frames
+
+    monkeypatch.setattr(audio, "get_queue_item_stream", _item_stream)
+
+    output = await _drain(_flow(audio, queue, track))
+
+    # the item's whole audio was mixed through as it came, not held back for the head
+    assert produced_at_end["item-1"] == track_frames
+    # ... so its last frames really are in the stream, with the head ducked over them
+    assert output[track_bytes - SAMPLE_SIZE : track_bytes] != bytes([0x10]) * SAMPLE_SIZE
+    assert len(output) == track_bytes + int((LEAD_CLIP_SECONDS - LEAD) * SAMPLE_SIZE)
+    report = leads[-1].anchor_report
+    assert report is not None
+    anchor = track_frames - int(LEAD * SECOND)
+    # the head starts on the frame it was anchored at, not later
+    assert report.anchor == anchor
+    assert _levels(output[(anchor - 1) * frame_size : anchor * frame_size]) == [0x1010]
+    assert max(_levels(output[anchor * frame_size : (anchor + 1) * frame_size])) > 0x1010
+    # the queue's stream time keeps running forward over the boundary
+    flow_log = mass.player_queues.queue_data.return_value.flow_mode_stream_log
+    stream_time = 0.0
+    elapsed: list[float] = []
+    for entry in flow_log:
+        stream_time += entry.seconds_streamed or 0.0
+        elapsed.append(stream_time)
+    assert elapsed == sorted(elapsed)
+    clip_body = LEAD_CLIP_SECONDS - LEAD
+    assert elapsed == pytest.approx([LEAD_TRACK_SECONDS, LEAD_TRACK_SECONDS + clip_body])
+
+
+async def test_a_declared_duration_miss_only_leaves_the_anchor_drift(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An item that delivers more audio than its declared duration still ends the head on it."""
-    audio, queue, track = _drift_flow(monkeypatch)
+    """An item longer than its declared duration keeps flowing; the head is simply placed early."""
+    audio, queue, track, produced_at_end = _drift_flow(monkeypatch)
     leads = _capture_leads(monkeypatch, audio)
 
     output = await _drain(_flow(audio, queue, track))
@@ -655,91 +705,90 @@ async def test_the_head_ends_where_the_item_really_ends(
     frame_size = SAMPLE_SIZE // SECOND
     real_end = int(DRIFT_REAL_SECONDS * SECOND)
     voice = int(LEAD * SECOND)
+    declared_end = LEAD_TRACK_SECONDS * SECOND
     report = leads[-1].anchor_report
     assert report is not None
-    # the anchor follows the audio the item really produced, not duration - seek
+    # the head is placed where the declared durations put it, and the item ended later
+    assert report.anchor == declared_end - voice
     assert report.produced_end == real_end
-    assert report.anchor == real_end - voice
-    assert report.declared_end == LEAD_TRACK_SECONDS * SECOND
-    # the declared durations put the head 219 ms early, which is what the fix moved out
-    assert report.anchor - (report.declared_end - voice) == real_end - report.declared_end
-    # everything before the head is untouched, the head is heard up to the item's end
-    before = report.anchor * frame_size
-    assert output[:before] == bytes([0x10]) * before
-    mixed_tail = output[before : real_end * frame_size]
-    assert mixed_tail != bytes([0x10]) * len(mixed_tail)
-    assert output[(real_end - 1) * frame_size : real_end * frame_size] != bytes([0x10]) * frame_size
-    # and what is left of that drift is inaudible
-    assert abs(report.drift_ms) < 50
+    assert report.declared_end == declared_end
+    # the item produced all of its audio, so the 219 ms the durations missed are in the stream
+    assert produced_at_end["item-1"] == real_end
+    assert output[: report.anchor * frame_size] == bytes([0x10]) * (report.anchor * frame_size)
+    missed = output[declared_end * frame_size : real_end * frame_size]
+    assert missed == bytes([0x10]) * len(missed)
+    assert output[real_end * frame_size :] == bytes([0x40]) * int(
+        (LEAD_CLIP_SECONDS - LEAD) * SAMPLE_SIZE
+    )
+    # the residue is what the report says: the head ends where the durations said it would
+    assert report.drift_ms == pytest.approx(-(real_end - declared_end) / SECOND * 1000, abs=1)
 
 
-async def test_a_lead_whose_source_still_streams_is_held_the_same_way(
+async def test_a_still_streaming_source_is_not_held_back_either(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A source that keeps trickling is held back like any other: the head ends on its end."""
-    audio, queue, track = _drift_flow(monkeypatch)
+    """A source that keeps trickling is mixed through like any other, to its last frame."""
+    audio, queue, track, produced_at_end = _drift_flow(monkeypatch)
     leads = _capture_leads(monkeypatch, audio)
-    # holding a still-streaming tail is what the player's buffer is there for
     cast("Any", track.streamdetails.buffer).eof = False
 
-    output = await _drain(_flow(audio, queue, track))
+    await _drain(_flow(audio, queue, track))
 
-    frame_size = SAMPLE_SIZE // SECOND
     real_end = int(DRIFT_REAL_SECONDS * SECOND)
-    voice = int(LEAD * SECOND)
     report = leads[-1].anchor_report
     assert report is not None
-    assert (report.anchor, report.produced_end, report.declared_end) == (
-        real_end - voice,
-        real_end,
-        LEAD_TRACK_SECONDS * SECOND,
-    )
-    assert abs(report.drift_ms) < 50
-    before = report.anchor * frame_size
-    assert output[:before] == bytes([0x10]) * before
+    assert report.produced_end == real_end
+    assert produced_at_end["item-1"] == real_end
+    assert report.anchor == LEAD_TRACK_SECONDS * SECOND - int(LEAD * SECOND)
 
 
-def test_a_lead_that_lost_its_window_reports_the_drift_it_kept() -> None:
-    """A head that lost its window can not be held, so the report measures what is left."""
+def test_a_late_anchor_is_clamped_forward_and_reported() -> None:
+    """A frame that already went by is moved to where the flow is, never waited for."""
     logger = MagicMock()
-    bus = _bus()
+    bus = _FlowProgramBus(TEST_PCM_FORMAT, logger)
     bus.feed(_music(1.0))
     lead = _ProgramLead(
         bus,
         logger,
         _voice(1.0),
         label="lead:clip",
-        declared_anchor=SECOND,
+        declared_anchor=int(0.5 * SECOND),
     )
-    # the item is already at the frame the declared durations put the head's end on
+
     assert lead.arm() == SECOND
+    assert any(
+        call.args[0] == "PROGRAM-BUS schedule label=%s started late by %.3fs"
+        for call in logger.debug.call_args_list
+    )
+    # the item's own audio is not rewound: it goes through as it comes, the head on top
+    mixed = bus.feed(_music(1.0))
+    lead.finish()
 
-    for _ in range(3):
-        released = lead.feed(_music(1.0))
-        assert released == _music(1.0)
-        bus.feed(released)
-    tail = lead.finish()
-
-    # nothing was held back: the item's own audio went through as it came
-    assert tail == ()
+    assert mixed != _music(1.0)
     report = lead.anchor_report
     assert report is not None
-    assert report.anchor == SECOND
-    assert (report.produced_end, report.declared_end) == (4 * SECOND, 2 * SECOND)
-    # the head's end sits 2 s before the item's end, and the report says exactly that
-    assert report.drift_ms == pytest.approx(-2000, abs=1)
+    assert (report.anchor, report.produced_end, report.declared_end) == (
+        SECOND,
+        2 * SECOND,
+        int(1.5 * SECOND),
+    )
+    # the clamp dropped the head's first half second, so its end sits on the item's end
+    assert report.drift_ms == pytest.approx(0, abs=1)
 
 
 def _drift_flow(
     monkeypatch: pytest.MonkeyPatch,
-) -> tuple[StreamsAudio, SimpleNamespace, SimpleNamespace]:
+) -> tuple[StreamsAudio, SimpleNamespace, SimpleNamespace, dict[str, int]]:
     """Build a flow whose item delivers 219 ms more audio than its declared duration."""
     track = _queue_item("item-1", "Track", duration=LEAD_TRACK_SECONDS)
     clip = _lead_clip()
-    audio, queue, _mass = _flow_audio(
+    audio, queue, mass = _flow_audio(
         monkeypatch, next_item=clip, load_next=[clip, QueueEmpty], program_bus=True
     )
     del audio.crossfade_allowed
+    published: list[_FlowProgramBus] = []
+    mass.streams.register_program_bus.side_effect = lambda _queue_id, bus: published.append(bus)
+    produced_at_end: dict[str, int] = {}
 
     async def _item_stream(
         queue_item: SimpleNamespace, *_args: object, **_kwargs: object
@@ -754,15 +803,17 @@ def _drift_flow(
         while remaining > 0:
             yield bytes([marker]) * int(min(1.0, remaining) * SAMPLE_SIZE)
             remaining -= 1.0
+        if queue_item.queue_item_id == "item-1" and published:
+            produced_at_end["item-1"] = published[0].produced_frames
 
     monkeypatch.setattr(audio, "get_queue_item_stream", _item_stream)
-    return audio, queue, track
+    return audio, queue, track, produced_at_end
 
 
-async def test_a_cancelled_lead_is_not_placed_behind_the_cancel(
+async def test_a_cancelled_lead_never_sounds_over_the_track(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A skip drops the head even after its tail was already held back on the bus."""
+    """A skip drops the head from the bus: the track plays out untouched."""
     audio, queue, mass, _opened, track = _lead_flow(monkeypatch, program_bus=True)
     published: list[_FlowProgramBus] = []
     mass.streams.register_program_bus.side_effect = lambda _queue_id, bus: published.append(bus)
@@ -782,7 +833,7 @@ async def test_a_cancelled_lead_is_not_placed_behind_the_cancel(
     track_bytes = int(LEAD_TRACK_SECONDS * SAMPLE_SIZE)
     assert output[:track_bytes] == bytes([0x10]) * track_bytes
     assert any(
-        call.args and call.args[0] == "PROGRAM-BUS anchor label=%s dropped: cancelled"
+        call.args[0] == "PROGRAM-BUS cancel reason=%s" and call.args[1] == "next"
         for call in logger.debug.call_args_list
     )
 
@@ -912,3 +963,137 @@ async def test_the_flow_runs_in_float_while_the_program_bus_can_mix(
     output_request = controller.audio.get_output_format.await_args
     assert output_request is not None
     assert output_request.kwargs["content_bit_depth"] == bit_depth
+
+
+THREE_ITEM_TRACK_SECONDS = 200
+
+
+def _clip_between_tracks_flow(
+    monkeypatch: pytest.MonkeyPatch, stop_after: dict[str, int]
+) -> tuple[StreamsAudio, SimpleNamespace, MagicMock, SimpleNamespace, SimpleNamespace]:
+    """Build a flow of track -> clip -> track, serving each item up to the given second."""
+    track = _queue_item("item-1", "Track", duration=LEAD_TRACK_SECONDS)
+    clip = _lead_clip()
+    after = _queue_item("item-3", "After", duration=THREE_ITEM_TRACK_SECONDS)
+    audio, queue, mass = _flow_audio(
+        monkeypatch,
+        next_item=clip,
+        load_next=[clip, after, QueueEmpty],
+        program_bus=True,
+    )
+    # the real rule decides whether the declared lead applies
+    del audio.crossfade_allowed
+    next_items = {"item-1": clip, "item-2": after}
+    mass.player_queues.get_next_item.side_effect = lambda _queue_id, item_id: next_items.get(
+        item_id
+    )
+
+    async def _item_stream(
+        queue_item: SimpleNamespace, *_args: object, **kwargs: object
+    ) -> AsyncGenerator[bytes]:
+        remaining = stop_after[queue_item.queue_item_id] - int(
+            cast("float", kwargs.get("seek_position", 0))
+        )
+        for _ in range(max(0, remaining)):
+            yield bytes([0x10]) * SAMPLE_SIZE
+            await asyncio.sleep(0)
+
+    monkeypatch.setattr(audio, "get_queue_item_stream", _item_stream)
+    return audio, queue, mass, track, after
+
+
+async def test_a_track_after_a_clip_keeps_its_own_duration(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The clip's seconds belong to the clip; the track behind it keeps its length."""
+    audio, queue, mass, track, after = _clip_between_tracks_flow(
+        monkeypatch, {"item-1": LEAD_TRACK_SECONDS, "item-2": LEAD_CLIP_SECONDS, "item-3": 200}
+    )
+    clip = _clip_of(mass)
+
+    await _drain(_flow(audio, queue, track))
+
+    assert clip.streamdetails.duration == LEAD_CLIP_SECONDS
+    assert after.streamdetails.duration == THREE_ITEM_TRACK_SECONDS
+    assert after.duration == THREE_ITEM_TRACK_SECONDS
+    assert after.streamdetails.seconds_streamed == THREE_ITEM_TRACK_SECONDS
+    flow_log = mass.player_queues.queue_data.return_value.flow_mode_stream_log
+    assert [entry.seek_position for entry in flow_log] == [0, LEAD, 0]
+    assert flow_log[2].duration == THREE_ITEM_TRACK_SECONDS
+
+
+async def test_a_track_after_a_clip_keeps_its_length_when_its_source_stops_short(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A source that stops mid-item must not hand the item its short streamed length."""
+    audio, queue, mass, track, after = _clip_between_tracks_flow(
+        monkeypatch, {"item-1": LEAD_TRACK_SECONDS, "item-2": LEAD_CLIP_SECONDS, "item-3": 5}
+    )
+    clip = _clip_of(mass)
+
+    await _drain(_flow(audio, queue, track))
+
+    # the clip keeps its own length and the track behind it keeps its 200 seconds
+    assert clip.streamdetails.duration == LEAD_CLIP_SECONDS
+    assert after.streamdetails.duration == THREE_ITEM_TRACK_SECONDS
+    assert after.duration == THREE_ITEM_TRACK_SECONDS
+    # what really reached the player stays honest, so the queue can still advance
+    assert after.streamdetails.seconds_streamed == 5
+    flow_log = mass.player_queues.queue_data.return_value.flow_mode_stream_log
+    assert [entry.seconds_streamed for entry in flow_log] == [
+        LEAD_TRACK_SECONDS,
+        LEAD_CLIP_SECONDS - LEAD,
+        5,
+    ]
+
+
+async def test_a_prefetched_stream_is_handed_over_after_the_item_was_resolved_again() -> None:
+    """The head was taken out of one stream; a re-resolve must not replay that head here."""
+    prefetcher = _IncomingFadePrefetcher(cast("Any", MagicMock()), TEST_PCM_FORMAT, "session")
+    clip = cast("Any", _queue_item("clip", "Transition", duration=LEAD_CLIP_SECONDS))
+    taken = StreamDetails(provider="ai_radio", item_id="clip_1", audio_format=TEST_PCM_FORMAT)
+    clip.streamdetails = taken
+
+    async def _body() -> AsyncGenerator[bytes]:
+        yield _voice(0.5)
+
+    prefetcher._task = asyncio.create_task(asyncio.sleep(0))
+    prefetcher._queue_item_id = "clip"
+    prefetcher._seek_position = 0
+    prefetcher._streamdetails = taken
+    prefetcher._stream = _body()
+    prefetcher._chunks = deque([_voice(0.25)])
+    await prefetcher._task
+
+    # preparing the clip's buffer resolves the same media into a new object
+    clip.streamdetails = StreamDetails(
+        provider="ai_radio", item_id="clip_1", audio_format=TEST_PCM_FORMAT
+    )
+    handed = await prefetcher.take(clip, 0)
+
+    assert handed is not None
+    assert b"".join([chunk async for chunk in handed]) == _voice(0.25) + _voice(0.5)
+
+
+def test_a_taken_head_still_counts_once_the_item_is_resolved_again() -> None:
+    """The queue resolves an item's details again for its buffer; the head stays that item's."""
+    prefetcher = _IncomingFadePrefetcher(cast("Any", MagicMock()), TEST_PCM_FORMAT, "session")
+    clip = cast("Any", _queue_item("clip", "Transition", duration=LEAD_CLIP_SECONDS))
+    taken = StreamDetails(provider="ai_radio", item_id="clip_1", audio_format=TEST_PCM_FORMAT)
+    clip.streamdetails = taken
+    prefetcher._task = cast("Any", MagicMock())
+    prefetcher._queue_item_id = "clip"
+    prefetcher._head_seconds = LEAD
+    prefetcher._streamdetails = taken
+
+    assert prefetcher.head_mixed(clip) == LEAD
+    # preparing the clip's buffer resolves the same media into a new object
+    clip.streamdetails = StreamDetails(
+        provider="ai_radio", item_id="clip_1", audio_format=TEST_PCM_FORMAT
+    )
+    assert prefetcher.head_mixed(clip) == LEAD
+    # a stream of another item at the same queue position is not the head that was taken
+    clip.streamdetails = StreamDetails(
+        provider="ai_radio", item_id="clip_2", audio_format=TEST_PCM_FORMAT
+    )
+    assert prefetcher.head_mixed(clip) is None

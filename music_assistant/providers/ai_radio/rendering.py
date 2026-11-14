@@ -143,8 +143,9 @@ class AIRadioRenderMixin:
     _render_locks: dict[str, asyncio.Lock]
     _media_cache: dict[str, _CachedClipMedia]
     _engine_loudness: dict[tuple[str, str, str], float]
-    # clip id -> (next queue item id or None, clip duration, half, the post planned against it)
-    _post_plans: dict[str, tuple[str | None, int | None, bool, TailOverlap | None]]
+    # clip id -> (next queue item id or None, clip duration, half, the post planned against it,
+    # and why there is none when there is not)
+    _post_plans: dict[str, tuple[str | None, int | None, bool, TailOverlap | None, str]]
 
     async def get_stream_details(self, item_id: str, media_type: MediaType) -> StreamDetails:
         """
@@ -276,7 +277,15 @@ class AIRadioRenderMixin:
                 # the head has to be known before the clip is due: the stream decides while
                 # the track before it still plays whether to hold that track's tail back
                 if queue_item.extra_attributes.get(ATTR_ALLOW_PRE):
-                    self._publish_pre(queue_item, self._plan_pre(queue_item, media.duration, None))
+                    self._publish_pre(
+                        queue_item,
+                        self._plan_pre(
+                            queue_item,
+                            media.duration,
+                            None,
+                            whole_break=self._no_post_reason(queue_item),
+                        ),
+                    )
 
     async def _render_clip(
         self, queue_item: QueueItem, prompt: str, clip_id: str
@@ -692,6 +701,8 @@ class AIRadioRenderMixin:
         queue_item: QueueItem,
         clip_duration: float | None,
         tail_overlap: TailOverlap | None,
+        *,
+        whole_break: str | None = None,
     ) -> tuple[float | None, str | None]:
         """
         Return how many seconds of the break play before the boundary, and the item they play over.
@@ -699,6 +710,7 @@ class AIRadioRenderMixin:
         :param queue_item: The clip being rendered.
         :param clip_duration: Length of the rendered break in seconds.
         :param tail_overlap: The overlap already planned after the boundary, if any.
+        :param whole_break: Why no post is planned, so the head carries the whole break.
         """
         if not clip_duration:
             return None, None
@@ -725,6 +737,19 @@ class AIRadioRenderMixin:
             # planned here could never be mixed
             self._pre_skipped(previous.name, "the queue plays without crossfade")
             return None, None
+        if whole_break is not None:
+            # no post to carry the break past the boundary, so the head takes all of it;
+            # only the reach back over the running track's tail is limited
+            overlap = min(clip_duration, TALK_OVER_MAX_PRE)
+            if overlap < MIN_PRE_SECONDS:
+                return None, None
+            self.logger.info(
+                "AI Radio pre takes the whole break: no post (%s), %.1fs over %s",
+                whole_break,
+                overlap,
+                previous.name,
+            )
+            return round(overlap, 3), previous.queue_item_id
         tail = tail_overlap.duration if tail_overlap is not None else 0.0
         # the stream never blends more than half of the incoming item, so a longer head would
         # be silently cut back; keeping the plan inside that bound makes log and audio agree
@@ -738,6 +763,17 @@ class AIRadioRenderMixin:
         )
         return round(overlap, 3), previous.queue_item_id
 
+    @staticmethod
+    def _no_post_reason(queue_item: QueueItem) -> str | None:
+        """
+        Return why the clip plays no post at all, or None while its section may still get one.
+
+        :param queue_item: The clip whose section decides whether it carries over.
+        """
+        if queue_item.extra_attributes.get(ATTR_ALLOW_POST):
+            return None
+        return "the section does not allow one"
+
     async def _plan_overlaps(
         self, queue_item: QueueItem, clip_id: str, clip_duration: int | None
     ) -> TailOverlap | None:
@@ -749,19 +785,28 @@ class AIRadioRenderMixin:
         :param clip_duration: Length of the rendered break in seconds.
         """
         allow_pre = bool(queue_item.extra_attributes.get(ATTR_ALLOW_PRE))
-        tail_overlap = (
-            await self._plan_post(
+        tail_overlap: TailOverlap | None = None
+        post_reason = self._no_post_reason(queue_item) or ""
+        if queue_item.extra_attributes.get(ATTR_ALLOW_POST):
+            tail_overlap, post_reason = await self._plan_post(
                 queue_item,
                 clip_id,
                 clip_duration,
                 # a pre splits the break at the boundary instead of keeping a head aside
                 half=allow_pre,
             )
-            if queue_item.extra_attributes.get(ATTR_ALLOW_POST)
-            else None
-        )
         if allow_pre:
-            self._publish_pre(queue_item, self._plan_pre(queue_item, clip_duration, tail_overlap))
+            self._publish_pre(
+                queue_item,
+                self._plan_pre(
+                    queue_item,
+                    clip_duration,
+                    tail_overlap,
+                    # with no post planned the head carries the whole break, so a short
+                    # break is not cut into a head, a body on the item and a tail
+                    whole_break=None if tail_overlap is not None else post_reason,
+                ),
+            )
         return tail_overlap
 
     def _publish_pre(self, queue_item: QueueItem, planned: tuple[float | None, str | None]) -> None:
@@ -808,9 +853,9 @@ class AIRadioRenderMixin:
         clip_duration: int | None,
         *,
         half: bool = False,
-    ) -> TailOverlap | None:
+    ) -> tuple[TailOverlap | None, str]:
         """
-        Return how far the clip may carry over the next track's intro, or None.
+        Return how far the clip may carry over the next track's intro, or None and why not.
 
         :param queue_item: The clip being rendered.
         :param clip_id: Id of the clip, for the plan cache.
@@ -825,10 +870,12 @@ class AIRadioRenderMixin:
         # a skip should log once until the next item changes
         planned = self._post_plans.get(clip_id)
         if planned is not None and planned[:3] == (next_item_id, clip_duration, half):
-            return planned[3]
-        tail_overlap = await self._plan_post_over(queue_item, next_item, clip_duration, half=half)
-        self._post_plans[clip_id] = (next_item_id, clip_duration, half, tail_overlap)
-        return tail_overlap
+            return planned[3], planned[4]
+        tail_overlap, reason = await self._plan_post_over(
+            queue_item, next_item, clip_duration, half=half
+        )
+        self._post_plans[clip_id] = (next_item_id, clip_duration, half, tail_overlap, reason)
+        return tail_overlap, reason
 
     async def _plan_post_over(
         self,
@@ -837,11 +884,19 @@ class AIRadioRenderMixin:
         clip_duration: int | None,
         *,
         half: bool = False,
-    ) -> TailOverlap | None:
-        """Return how far the clip may carry over the next track's intro, or None."""
+    ) -> tuple[TailOverlap | None, str]:
+        """
+        Return how far the clip may carry over the next track's intro, or None and why not.
+
+        :param queue_item: The clip being rendered.
+        :param next_item: The item that plays after the clip, if any.
+        :param clip_duration: Length of the rendered break in seconds.
+        :param half: Cap the overlap at half the break, leaving the other half to a pre.
+        """
         if next_item is None or not isinstance(next_item.media_item, Track):
-            self._post_skipped(queue_item.name, "no next track in the queue")
-            return None
+            reason = "no next track in the queue"
+            self._post_dropped(queue_item.name, reason)
+            return None, reason
         # the overlap is only mixed at a flow stream's boundary or between the item streams
         # of a player that plays gapless; a show requires its boundaries mixed before its
         # first play start, so its first clip already passes here
@@ -852,46 +907,46 @@ class AIRadioRenderMixin:
             or self.mass.streams.boundary_mix_required(queue.queue_id)
             or self.mass.streams.mixes_item_boundaries(queue.queue_id)
         ):
-            self._post_skipped(
-                next_item.name, "the player neither plays gapless nor streams in flow mode"
-            )
-            return None
+            reason = "the player neither plays gapless nor streams in flow mode"
+            self._post_dropped(next_item.name, reason)
+            return None, reason
         # which copy of the track streams is only known once its stream details are
         # resolved: the queue resolves them now rather than when the clip nears its end,
         # as it will again then, and moves on to the item after a track it cannot play
         loaded, reason = await self._load_next_item(queue_item)
         if loaded is None:
-            self._post_skipped(next_item.name, reason)
-            return None
+            self._post_dropped(next_item.name, reason)
+            return None, reason
         if not isinstance(loaded.media_item, Track):
-            self._post_skipped(loaded.name, "the item that plays next is not a track")
-            return None
+            reason = "the item that plays next is not a track"
+            self._post_dropped(loaded.name, reason)
+            return None, reason
         next_item = loaded
         onset, reason = await self._resolve_vocal_onset(next_item)
         if onset is None:
-            self._post_skipped(next_item.name, reason)
-            return None
+            self._post_dropped(next_item.name, reason)
+            return None, reason
         window = onset - VOICE_OVER_RAMP
         if window < POST_MIN_SECONDS:
-            self._post_skipped(
-                next_item.name, f"vocal enters at {onset:.1f}s, too little instrumental intro"
-            )
-            return None
+            reason = f"vocal enters at {onset:.1f}s, too little instrumental intro"
+            self._post_dropped(next_item.name, reason)
+            return None, reason
         limit = (clip_duration or 0) / 2 if half else (clip_duration or 0) - POST_MIN_HEAD_SECONDS
         overlap = min(window, limit)
         if overlap < POST_MIN_SECONDS:
-            self._post_skipped(
-                next_item.name,
-                f"break is only {clip_duration or 0:.1f}s, too short to carry over",
-            )
-            return None
+            reason = f"break is only {clip_duration or 0:.1f}s, too short to carry over"
+            self._post_dropped(next_item.name, reason)
+            return None, reason
         self.logger.info(
             "AI Radio post armed on %s: last %.1fs of the break over the intro, vocal at %.1fs",
             next_item.name,
             overlap,
             onset,
         )
-        return TailOverlap(duration=round(overlap, 3), next_queue_item_id=next_item.queue_item_id)
+        return (
+            TailOverlap(duration=round(overlap, 3), next_queue_item_id=next_item.queue_item_id),
+            "",
+        )
 
     async def _load_next_item(self, queue_item: QueueItem) -> tuple[QueueItem | None, str]:
         """Return the item the queue plays after the clip, loaded, or the reason it has none."""
@@ -958,8 +1013,13 @@ class AIRadioRenderMixin:
             streamdetails.item_id, streamdetails.provider
         )
 
-    def _post_skipped(self, item_name: str, reason: str) -> None:
-        """Log why an opted-in break does not carry over the next track."""
+    def _post_dropped(self, item_name: str, reason: str) -> None:
+        """
+        Log why an opted-in break does not carry over the next track.
+
+        :param item_name: Name of the item the break would have carried over.
+        :param reason: Why the post cannot be mixed.
+        """
         # INFO: only sections that opted in reach here, and a post that quietly does not
         # happen looks the same as one that was never enabled
-        self.logger.info("AI Radio post skipped on %s: %s", item_name, reason)
+        self.logger.info("AI Radio post dropped on %s: %s", item_name, reason)

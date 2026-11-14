@@ -532,9 +532,6 @@ class _FlowProgramBus:
         self._logger = logger
         self._frame_size = (pcm_format.bit_depth // 8) * pcm_format.channels
         self.produced_frames = 0
-        # bumped whenever the session is told to drop its programs, so a program that is
-        # not placed yet can tell that it was cancelled in the meantime
-        self.cancel_generation = 0
         self._overlays: list[_ProgramOverlay] = []
 
     @property
@@ -653,7 +650,6 @@ class _FlowProgramBus:
 
         :param reason: Why they are dropped, for the log.
         """
-        self.cancel_generation += 1
         if not self._overlays:
             return
         self._overlays.clear()
@@ -671,26 +667,6 @@ class _FlowProgramBus:
             return
         self._overlays = [overlay for overlay in self._overlays if overlay.label != label]
         self._logger.debug("PROGRAM-BUS cancel reason=%s label=%s", reason, label)
-
-    def drop_unreached(self, label_prefix: str, reason: str) -> None:
-        """
-        Drop programs of the given label that are still ahead of the produced frames.
-
-        :param label_prefix: Label prefix the dropped programs share.
-        :param reason: Why they are dropped, for the log.
-        """
-        remaining = [
-            overlay
-            for overlay in self._overlays
-            if overlay.label.startswith(label_prefix)
-            and overlay.start_frame >= self.produced_frames
-        ]
-        if not remaining:
-            return
-        self._overlays = [overlay for overlay in self._overlays if overlay not in remaining]
-        self._logger.debug(
-            "PROGRAM-BUS cancel reason=%s label=%s", reason, ",".join(o.label for o in remaining)
-        )
 
     # --- Private methods ---
 
@@ -723,14 +699,16 @@ class _LeadAnchorReport:
 
 class _ProgramLead:
     """
-    A clip's head, mixed over the running item's tail so that it ends where the item ends.
+    A clip's head, placed on the bus over the tail of the item it was planned against.
 
-    The head has to end exactly on the item's last frame: the clip's own stream continues
-    from there, so an anchor short of the item's end leaves a hole in its speech. A track's
-    duration is a whole-second media estimate and a seek lands a few hundred ms away from
-    it, so the anchor is not derived from declared durations. Instead the item's last
-    `lead` is held back from the bus and the head is placed on that tail once the item's
-    stream ends: its end then falls on the frame the item really ended on.
+    The head has to end on the item's last frame: the clip's own stream continues from
+    there, so an end short of it leaves a hole in its speech. A track's duration is a
+    whole-second estimate and a seek lands a few hundred ms away from it, so the placement
+    can not be exact. It is also not bought with a hold: withholding the item's last
+    seconds starves a player whose buffer is shorter than the lead, which is heard as the
+    stream standing still and the reported position stepping back. The head is placed where
+    the declared durations put the item's end, the bus moves it forward when that frame is
+    already produced, and the residue is reported as the anchor drift once the item ended.
     """
 
     def __init__(
@@ -743,7 +721,7 @@ class _ProgramLead:
         declared_anchor: int,
     ) -> None:
         """
-        Prepare the head and its tail hold.
+        Prepare the head and its placement.
 
         :param program_bus: The session's program bus.
         :param logger: Logger of the audio sub-controller, for the drift report.
@@ -759,20 +737,9 @@ class _ProgramLead:
         self._frame_size = max(program_bus.frame_size, 1)
         self._sample_rate = max(program_bus.pcm_format.sample_rate, 1)
         self.voice_frames = len(voice_pcm) // self._frame_size
-        # the head is held back from the bus in whole frames, exactly as long as it is
-        self._hold_bytes = self.voice_frames * self._frame_size
-        self._tail: deque[bytes] = deque()
-        self._tail_bytes = 0
-        self._holding = False
         self._anchor: int | None = None
-        self._cancel_generation = program_bus.cancel_generation
-        self._placed = False
+        self._finished = False
         self._report: _LeadAnchorReport | None = None
-
-    @property
-    def placed(self) -> bool:
-        """Return whether the head is placed on the bus."""
-        return self._placed
 
     @property
     def anchor_report(self) -> _LeadAnchorReport | None:
@@ -785,97 +752,38 @@ class _ProgramLead:
 
         :return: The frame it was anchored at, or None when it can not be mixed.
         """
+        # the window the declared durations give, so the head can not outlast the item
         self._anchor = self._bus.schedule(
             self._pcm,
             self._declared_anchor,
             label=self.label,
             stop_frame=self._declared_anchor + self.voice_frames,
         )
-        self._placed = self._anchor is not None
         return self._anchor
 
-    def feed(self, chunk: bytes) -> bytes:
+    def finish(self) -> None:
         """
-        Take one chunk of the item and return the part of it that may be mixed now.
+        Report where the head landed once the item's own stream ended.
 
-        The item's last frames are kept back (see the class docstring), everything before
-        them goes through the bus at once, so the item's own audio is not delayed.
-
-        :param chunk: One chunk of the item's audio, in the flow's PCM format.
+        A head whose window is not over yet is dropped here: what is left of it would sound
+        over the item after this one while that item's body starts its own speech.
         """
-        if not chunk:
-            return b""
-        if not self._holding:
-            if not self._may_hold():
-                return chunk
-            self._holding = True
-            # the declared anchor was a guess: the item's produced end replaces it
-            self._bus.cancel(self.label, "tail held back for the item's real end")
-            self._logger.debug(
-                "PROGRAM-BUS lead label=%s holding its last %.2fs back for its real end",
-                self.label,
-                self._hold_bytes / self._frame_size / self._sample_rate,
-            )
-        self._tail.append(chunk)
-        self._tail_bytes += len(chunk)
-        released = bytearray()
-        while self._tail_bytes - len(self._tail[0]) >= self._hold_bytes:
-            head = self._tail.popleft()
-            self._tail_bytes -= len(head)
-            released += head
-        return bytes(released)
-
-    def finish(self) -> tuple[bytes, ...]:
-        """
-        Place the head on the frame the item really ended on.
-
-        :return: The held tail, still to be mixed through the bus.
-        """
-        tail, held_bytes = tuple(self._tail), self._tail_bytes
-        self._tail.clear()
-        self._tail_bytes = 0
-        if self._hold_was_cancelled():
-            # the queue moved on and its programs were dropped: this head goes with them
-            self._holding = False
-            self._placed = False
-            self._logger.debug("PROGRAM-BUS anchor label=%s dropped: cancelled", self.label)
-            return tail
-        if self._holding:
-            self._holding = False
-            end_frame = self._bus.produced_frames + held_bytes // self._frame_size
-            requested_anchor = end_frame - self.voice_frames
-            self._anchor = self._bus.schedule(
-                self._pcm,
-                requested_anchor,
-                label=self.label,
-                stop_frame=end_frame,
-            )
-            self._placed = self._anchor == requested_anchor
-            if not self._placed:
-                # another program took the tail's window: a head that does not end on the
-                # item's end would leave a hole before the body, so it is left to the clip
-                if self._anchor is not None:
-                    self._bus.cancel(self.label, "not on the item's end")
-                self._logger.debug(
-                    "PROGRAM-BUS anchor label=%s dropped: no room for it at the item's end",
-                    self.label,
-                )
-                return tail
-        else:
-            # nothing was held: the item's declared end is all the head was placed on
-            end_frame = self._bus.produced_frames
+        if self._finished:
+            return
+        self._finished = True
+        end_frame = self._bus.produced_frames
         self._log_drift(end_frame)
-        return tail
+        if self._anchor is not None and self._anchor + self.voice_frames > end_frame:
+            self._bus.cancel(self.label, "item ended before its head")
+
+    def abandon(self) -> None:
+        """Drop the head when the item's stream ends before it reached its anchor."""
+        if self._finished:
+            return
+        self._finished = True
+        self._bus.cancel(self.label, "the item was abandoned")
 
     # --- Private methods ---
-
-    def _hold_was_cancelled(self) -> bool:
-        """Return whether the session dropped its programs after this head was armed."""
-        return self._holding and self._bus.cancel_generation != self._cancel_generation
-
-    def _may_hold(self) -> bool:
-        """Return whether holding the tail back can still put the head on the item's end."""
-        return self._hold_bytes > 0 and self._bus.produced_frames < self._declared_anchor
 
     def _log_drift(self, end_frame: int) -> None:
         """
@@ -906,34 +814,28 @@ async def _through_program_bus(
     music: AsyncGenerator[bytes],
     program_bus: _FlowProgramBus,
     lead: _ProgramLead | None = None,
-    prefetcher: _IncomingFadePrefetcher | None = None,
 ) -> AsyncGenerator[bytes]:
     """
     Run an item's audio through the session's program bus.
 
     :param music: The item's own stream.
     :param program_bus: The session's program bus.
-    :param lead: The clip's head to place on this item's end, if one was armed for it.
-    :param prefetcher: The prefetch the head was taken out of, if any.
+    :param lead: The clip's head placed over this item's tail, if one was armed for it.
     """
+    finished = False
     try:
+        # a lead never holds the item back: every chunk goes through as it comes, so the
+        # player is fed at the rate the source delivers
         async for chunk in music:
-            if lead is None:
-                yield program_bus.feed(chunk)
-                continue
-            released = lead.feed(chunk)
-            if released:
-                yield program_bus.feed(released)
-        if lead is not None:
-            # the item's end is known now: the head is placed on it and the tail it was
-            # held back for is mixed through the bus with the head on top of it
-            for held in lead.finish():
-                yield program_bus.feed(held)
-            if not lead.placed and prefetcher is not None:
-                # the head was taken out of the stream but can not be placed: drop that
-                # prefetch, so the item's own stream plays it from the start
-                await prefetcher.close()
+            yield program_bus.feed(chunk)
+        finished = True
     finally:
+        if lead is not None:
+            # the item's end is known now: report where the head landed
+            if finished:
+                lead.finish()
+            else:
+                lead.abandon()
         # closing this wrapper has to release the decoder underneath it as well
         await music.aclose()
 
@@ -963,6 +865,24 @@ def tail_hold_target(queue_item: QueueItem, max_bytes: int, frame_size: int) -> 
     if not source_fully_buffered(queue_item):
         return 0
     return max_bytes // frame_size * frame_size
+
+
+def delivered_media_covers_item(streamdetails: StreamDetails, delivered_seconds: float) -> bool:
+    """
+    Return whether what a source or the flow delivered may stand in for the item's length.
+
+    A source that loses its session (another stream taking its slot, a provider
+    session that moved on) ends in a clean EOF mid-item, exactly like the item
+    ending. What was delivered is then shorter than the item itself, and that
+    shortfall is not the item's length: it would make the queue play the item as
+    that much shorter next time. Only a delivered length that reaches the item's
+    own media-time confirms or extends it.
+
+    :param streamdetails: The item's stream details, still holding its own length.
+    :param delivered_seconds: Media-time delivered for the item, from where it started.
+    """
+    declared = streamdetails.duration or 0
+    return not declared or delivered_seconds >= declared
 
 
 async def _incoming_overlap_stream(
@@ -1177,10 +1097,7 @@ class _IncomingFadePrefetcher:
         """
         if self._task is None or self._head_seconds is None:
             return None
-        if (
-            self._queue_item_id != queue_item.queue_item_id
-            or self._streamdetails is not queue_item.streamdetails
-        ):
+        if not self._prefetch_is_for(queue_item):
             return None
         return self._head_seconds
 
@@ -1197,11 +1114,7 @@ class _IncomingFadePrefetcher:
         """
         if self._task is None:
             return None
-        if (
-            self._queue_item_id != queue_item.queue_item_id
-            or self._streamdetails is not queue_item.streamdetails
-            or self._seek_position != seek_position
-        ):
+        if not self._prefetch_is_for(queue_item) or self._seek_position != seek_position:
             await self.close()
             return None
         # stop collecting: from here the flow stream reads the same generator itself
@@ -1255,6 +1168,28 @@ class _IncomingFadePrefetcher:
         self._target = 0
         self._failed = False
         self._head_seconds = None
+
+    def _prefetch_is_for(self, queue_item: QueueItem) -> bool:
+        """
+        Return whether the prefetched stream is the current stream of the given item.
+
+        :param queue_item: The item the flow stream is about to play.
+        """
+        streamdetails = queue_item.streamdetails
+        if self._queue_item_id != queue_item.queue_item_id or streamdetails is None:
+            return False
+        if self._streamdetails is streamdetails:
+            return True
+        # the queue resolves an item's stream details again for its buffer, and that is a new
+        # object for the same media: only a different media is a different stream, and taking
+        # the objects for it would drop a head that is already on the bus and replay it here
+        return (
+            getattr(self._streamdetails, "item_id", None),
+            getattr(self._streamdetails, "provider", None),
+        ) == (
+            getattr(streamdetails, "item_id", None),
+            getattr(streamdetails, "provider", None),
+        )
 
     async def _collect(
         self, stream: AsyncGenerator[bytes], chunks: deque[bytes], what: str = "fade-in"
@@ -3204,12 +3139,14 @@ class StreamsAudio:
             uncredited_tail_seconds = uncredited_tail_bytes / pcm_format.pcm_sample_size
             # streamdetails.duration is in media-time; seconds_streamed is stream-time
             # (post-atempo), so we scale by playback_speed to recover media-time.
-            streamdetails.duration = int(
+            written_seconds = (
                 streamdetails.seek_position
                 + (seconds_streamed + uncredited_tail_seconds) * playback_speed
             )
-            # propagate accurate duration to queue_item so UI displays it
-            queue_item.duration = streamdetails.duration
+            if delivered_media_covers_item(streamdetails, written_seconds):
+                streamdetails.duration = int(written_seconds)
+                # propagate accurate duration to queue_item so UI displays it
+                queue_item.duration = streamdetails.duration
         self.logger.debug(
             "Finished Streaming queue track: %s (%s) on queue %s "
             "- crossfade data prepared for next track: %s",
@@ -3660,8 +3597,8 @@ class StreamsAudio:
                         session_id=flow_session_id,
                         prepared_buffer=incoming_audio_buffer,
                     )
-                # a clip may start over this item's tail: arm its head on the session's
-                # program bus, to be placed where this item really ends
+                # a clip may start over this item's tail: place its head on the session's
+                # program bus at the frame the declared durations put this item's end on
                 lead: _ProgramLead | None = None
                 if program_bus is not None:
                     lead = await self._schedule_program_lead(
@@ -3673,9 +3610,7 @@ class StreamsAudio:
                         track_playback_speed,
                         incoming_prefetcher,
                     )
-                    item_stream = _through_program_bus(
-                        item_stream, program_bus, lead, incoming_prefetcher
-                    )
+                    item_stream = _through_program_bus(item_stream, program_bus, lead)
 
                 # closing here releases the decoders on an early exit,
                 # instead of leaving them to the garbage collector
@@ -3913,11 +3848,6 @@ class StreamsAudio:
                     )
                     return
 
-                if program_bus is not None and lead is not None:
-                    # a lead this item never reached would otherwise play over the item
-                    # after it, where it does not belong
-                    program_bus.drop_unreached(lead.label, "item ended before its anchor")
-
                 # A source error after partial audio must not look like a completed item.
                 # Progress reporting skips items with stream_error, so the item is not
                 # marked played; move on to the next queue item like the zero-audio path.
@@ -4024,13 +3954,15 @@ class StreamsAudio:
                     # streamdetails.duration is in media-time; seconds_streamed is stream-time
                     # (post-atempo), so we scale by the track's playback_speed to recover media-time.
                     assert play_log_entry.seek_position is not None
-                    queue_track.streamdetails.duration = int(
+                    written_seconds = (
                         play_log_entry.seek_position
                         + (seconds_streamed + tail_seconds) * track_playback_speed
                     )
-                    # propagate accurate duration to queue_item so UI displays it
-                    queue_track.duration = queue_track.streamdetails.duration
-                    play_log_entry.duration = queue_track.streamdetails.duration
+                    if delivered_media_covers_item(queue_track.streamdetails, written_seconds):
+                        queue_track.streamdetails.duration = int(written_seconds)
+                        # propagate accurate duration to queue_item so UI displays it
+                        queue_track.duration = queue_track.streamdetails.duration
+                        play_log_entry.duration = queue_track.streamdetails.duration
                 if last_play_log_entry is play_log_entry and last_fadeout_part:
                     # Pre-count the full crossfade tail so the queue index calculation
                     # doesn't undercount while waiting for the next track's crossfade mix.
@@ -5610,7 +5542,12 @@ class StreamsAudio:
             seconds_received = bytes_sent / pcm_format.pcm_sample_size if bytes_sent else 0
             # store accurate duration, but only for a playthrough from the very start:
             # a seeked stream yields the remaining audio, not the item's full length
-            if finished and not requested_seek_position and seconds_received:
+            if (
+                finished
+                and not requested_seek_position
+                and seconds_received
+                and delivered_media_covers_item(streamdetails, seconds_received)
+            ):
                 streamdetails.duration = int(seconds_received)
 
             logger.log(
@@ -5793,11 +5730,13 @@ class StreamsAudio:
         incoming_prefetcher: _IncomingFadePrefetcher,
     ) -> _ProgramLead | None:
         """
-        Arm the next clip's head on the program bus at the frame this item ends on.
+        Place the next clip's head on the program bus at the frame this item ends on.
 
         The head is taken out of the stream the clip continues on, so the clip is decoded
         once: the bus plays it over this item's tail and the clip's own stream carries on
-        from past it, reported from the media time it is really heard at.
+        from past it, reported from the media time it is really heard at. The item's own
+        audio is not held back for the placement; the frame comes from the declared
+        durations and the residue is reported as the anchor drift.
 
         :param program_bus: The session's program bus.
         :param queue_id: The queue the item plays on.
@@ -5868,8 +5807,8 @@ class StreamsAudio:
         self.logger.info(
             "Starting %s over the last %.1fs of %s", next_item.name, lead_seconds, queue_track.name
         )
-        # the anchor the declared durations give is only a starting point: the head is
-        # moved onto the item's produced end when its tail is released (see _ProgramLead)
+        # the anchor the declared durations give is the placement: nothing of this item is
+        # held back for it, and the residue is reported when the item really ended
         lead = _ProgramLead(
             program_bus,
             self.logger,

@@ -66,6 +66,7 @@ from music_assistant.providers.ai_radio.constants import (
     DEFAULT_LLM_INSTRUCTIONS,
     FALLBACK_TRACK_SECONDS,
     MIN_LOUDNESS_REFERENCE_SECONDS,
+    MIN_PRE_SECONDS,
     NO_WEATHER_DATA_INSTRUCTION,
     TALK_OVER_MAX_PRE,
     TTS_CLIP_PCM_FORMAT,
@@ -2336,4 +2337,113 @@ async def test_a_pre_caps_the_post_at_half_the_break() -> None:
     half = streamdetails.duration / 2
     assert streamdetails.tail_overlap.duration == pytest.approx(half, abs=0.1)
     assert clip.extra_attributes[ATTR_PRE_OVERLAP] == pytest.approx(half, abs=0.1)
+    assert clip.extra_attributes[ATTR_PRE_FROM] == song.queue_item_id
+
+
+def test_a_whole_break_head_is_not_capped_at_half_the_break() -> None:
+    """A head that carries the break alone reaches further back than half of it, up to the limit."""
+    renderer = DummyRenderer()
+    song = _song(0)
+    clip = _dj_clip_item("djlive", 1)
+    _attach_queue(renderer, [song, clip])
+    _attach_post(renderer, None)
+
+    assert renderer._plan_pre(clip, 8.0, None, whole_break="no post") == (
+        8.0,
+        song.queue_item_id,
+    )
+    assert renderer._plan_pre(clip, 45.0, None, whole_break="no post") == (
+        TALK_OVER_MAX_PRE,
+        song.queue_item_id,
+    )
+    assert renderer._plan_pre(clip, 0.4, None, whole_break="no post") == (None, None)
+
+
+async def test_the_pre_takes_the_whole_break_when_the_post_cannot_air(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A break whose post has no instrumental intro carries all of itself over the outro."""
+    renderer = DummyRenderer()
+    song = _song(0)
+    clip = _posting_clip_item()
+    clip.extra_attributes[ATTR_ALLOW_PRE] = True
+    _attach_queue(renderer, [song, clip])
+    _attach_post(renderer, _track_item(), analysis_onset=0.5)
+
+    with caplog.at_level(logging.INFO, logger="tests.ai_radio.rendering"):
+        streamdetails = await renderer.get_stream_details("sess_001", MediaType.SOUND_EFFECT)
+
+    assert streamdetails.duration == 9
+    assert streamdetails.tail_overlap is None
+    assert clip.extra_attributes[ATTR_PRE_OVERLAP] == streamdetails.duration
+    assert clip.extra_attributes[ATTR_PRE_FROM] == song.queue_item_id
+    assert any("pre takes the whole break" in message for message in caplog.messages)
+    dropped = [message for message in caplog.messages if "post dropped" in message]
+    assert dropped
+    assert all("vocal enters at 0.5s" in message for message in dropped)
+
+
+async def test_the_whole_break_head_stops_at_the_reach_back_limit() -> None:
+    """A break longer than the stream reaches back plays its head over the outro and the rest on."""
+    renderer = DummyRenderer()
+    cast("Any", renderer)._probe_duration = AsyncMock(return_value=40)
+    song = _song(0)
+    clip = _posting_clip_item()
+    clip.extra_attributes[ATTR_ALLOW_PRE] = True
+    _attach_queue(renderer, [song, clip])
+    _attach_post(renderer, _track_item(), analysis_onset=0.5)
+
+    streamdetails = await renderer.get_stream_details("sess_001", MediaType.SOUND_EFFECT)
+
+    assert streamdetails.tail_overlap is None
+    assert clip.extra_attributes[ATTR_PRE_OVERLAP] == TALK_OVER_MAX_PRE
+    assert clip.extra_attributes[ATTR_PRE_FROM] == song.queue_item_id
+
+
+async def test_the_pre_and_the_post_add_up_to_the_break() -> None:
+    """When the post fits, the break still splits at the boundary with no body left on the item."""
+    renderer = DummyRenderer()
+    song = _song(0)
+    clip = _posting_clip_item()
+    clip.extra_attributes[ATTR_ALLOW_PRE] = True
+    _attach_queue(renderer, [song, clip])
+    _attach_post(renderer, _track_item(), analysis_onset=12.0)
+
+    streamdetails = await renderer.get_stream_details("sess_001", MediaType.SOUND_EFFECT)
+
+    assert streamdetails.duration is not None
+    assert streamdetails.tail_overlap is not None
+    pre = clip.extra_attributes[ATTR_PRE_OVERLAP]
+    assert pre >= MIN_PRE_SECONDS
+    assert pre + streamdetails.tail_overlap.duration == pytest.approx(streamdetails.duration)
+
+
+async def test_a_break_without_a_pre_whose_post_cannot_air_plays_whole_at_the_boundary() -> None:
+    """A section that opts out of a pre keeps today's behaviour: nothing is mixed for it."""
+    renderer = DummyRenderer()
+    clip = _posting_clip_item()
+    _attach_queue(renderer, [_song(0), clip])
+    _attach_post(renderer, _track_item(), analysis_onset=0.5)
+
+    streamdetails = await renderer.get_stream_details("sess_001", MediaType.SOUND_EFFECT)
+
+    assert streamdetails.tail_overlap is None
+    assert ATTR_PRE_OVERLAP not in clip.extra_attributes
+    assert ATTR_PRE_FROM not in clip.extra_attributes
+
+
+async def test_a_section_without_a_post_publishes_its_whole_break_head_ahead() -> None:
+    """A section that plays no post has its head known before the track under it even starts."""
+    renderer = DummyRenderer()
+    song = _song(0)
+    clip = _dj_clip_item("djlive", 1)
+    _attach_queue(renderer, [song, clip])
+    _attach_post(renderer, _track_item(), analysis_onset=0.5)
+    clip.extra_attributes[ATTR_ALLOW_PRE] = True
+    started = _play_queue(renderer)
+
+    renderer._render_ahead("player_a")
+    await asyncio.gather(*started.values())
+
+    assert clip.extra_attributes[ATTR_PRE_OVERLAP] == 9
     assert clip.extra_attributes[ATTR_PRE_FROM] == song.queue_item_id
