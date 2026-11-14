@@ -723,11 +723,6 @@ class StreamsController(CoreController):
                 key=CONF_STREAM_PROGRAM_BUS,
                 type=ConfigEntryType.BOOLEAN,
                 default_value=False,
-                label="Experimental: announcements in the middle of a track (program bus)",
-                description="Mixes announcements into the running stream instead of interrupting "
-                "playback. A lead a provider plans (`allow_pre`) only takes effect while this "
-                "is on, because a realtime source cannot hold its tail back for the clip to "
-                "start over: without it the clip begins at the boundary.",
                 category="playback",
                 advanced=True,
             ),

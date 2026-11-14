@@ -453,6 +453,10 @@
     },
     "image_engine_unavailable": {
       "label": "No image engine is available. Set up a plugin that can generate images, for example the Home Assistant plugin with an AI task entity that supports images, or the OpenAI Compatible plugin with an image model selected."
+    },
+    "stream_program_bus": {
+      "label": "Experimental: announcements in the middle of a track (program bus)",
+      "description": "Mixes announcements into the running stream instead of interrupting playback. A lead a provider plans (allow_pre) only takes effect while this is on, because a realtime source cannot hold its tail back for the clip to start over: without it the clip begins at the boundary."
     }
   },
   "config_categories": {
