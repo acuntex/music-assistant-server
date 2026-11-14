@@ -68,9 +68,8 @@ from .constants import (
     MIN_LOUDNESS_REFERENCE_SECONDS,
     MIN_PRE_SECONDS,
     NO_WEATHER_DATA_INSTRUCTION,
-    POST_ANALYSIS_ONSET_LEAD,
+    POST_DEFAULT_INTRO_SECONDS,
     POST_LOAD_TIMEOUT,
-    POST_LYRICS_TIMEOUT,
     POST_MIN_HEAD_SECONDS,
     POST_MIN_SECONDS,
     RENDER_AHEAD_ITEMS,
@@ -83,7 +82,6 @@ from .constants import (
     WEATHER_PLACEHOLDER_TOKENS,
 )
 from .helpers import coerce_int, format_ai_radio_timestamp, soft_limit_text
-from .post_window import lyric_onset
 
 if TYPE_CHECKING:
     from collections.abc import AsyncGenerator
@@ -866,8 +864,8 @@ class AIRadioRenderMixin:
             queue_item.queue_id, queue_item.queue_item_id
         )
         next_item_id = next_item.queue_item_id if next_item is not None else None
-        # every path that resolves the clip asks again, the lyrics lookup is not cheap and
-        # a skip should log once until the next item changes
+        # every path that resolves the clip asks again, and a skip should log once until
+        # the next item changes
         planned = self._post_plans.get(clip_id)
         if planned is not None and planned[:3] == (next_item_id, clip_duration, half):
             return planned[3], planned[4]
@@ -922,13 +920,24 @@ class AIRadioRenderMixin:
             self._post_dropped(loaded.name, reason)
             return None, reason
         next_item = loaded
-        onset, reason = await self._resolve_vocal_onset(next_item)
+        # the stored analysis is the only onset source: it is local, so planning cannot
+        # wait on a metadata provider while the break is already due to air
+        onset = await self._analysis_vocal_onset(next_item)
         if onset is None:
-            self._post_dropped(next_item.name, reason)
-            return None, reason
-        window = onset - VOICE_OVER_RAMP
+            self.logger.info(
+                "AI Radio post timing: no analysis onset, using %.1fs",
+                POST_DEFAULT_INTRO_SECONDS,
+            )
+            window = POST_DEFAULT_INTRO_SECONDS
+        else:
+            self.logger.info("AI Radio post timing: analysis onset %.1fs", onset)
+            window = onset - VOICE_OVER_RAMP
         if window < POST_MIN_SECONDS:
-            reason = f"vocal enters at {onset:.1f}s, too little instrumental intro"
+            reason = (
+                f"vocal enters at {onset:.1f}s, too little instrumental intro"
+                if onset is not None
+                else f"assumed intro of {POST_DEFAULT_INTRO_SECONDS:.1f}s is too short"
+            )
             self._post_dropped(next_item.name, reason)
             return None, reason
         limit = (clip_duration or 0) / 2 if half else (clip_duration or 0) - POST_MIN_HEAD_SECONDS
@@ -938,10 +947,9 @@ class AIRadioRenderMixin:
             self._post_dropped(next_item.name, reason)
             return None, reason
         self.logger.info(
-            "AI Radio post armed on %s: last %.1fs of the break over the intro, vocal at %.1fs",
+            "AI Radio post armed on %s: last %.1fs of the break over the intro",
             next_item.name,
             overlap,
-            onset,
         )
         return (
             TailOverlap(duration=round(overlap, 3), next_queue_item_id=next_item.queue_item_id),
@@ -961,48 +969,6 @@ class AIRadioRenderMixin:
         except MusicAssistantError as err:
             return None, f"the next track could not be loaded ({err})"
         return next_item, ""
-
-    async def _resolve_vocal_onset(self, queue_item: QueueItem) -> tuple[float | None, str]:
-        """Return the second the track's vocal enters, and the reason when there is none."""
-        # asked side by side, so the slower source alone bounds the wait
-        analysis, (lyrics, reason) = await asyncio.gather(
-            self._analysis_vocal_onset(queue_item),
-            self._lyric_vocal_onset(cast("Track", queue_item.media_item)),
-        )
-        self.logger.debug(
-            "AI Radio vocal onset for %s: analysis %s, lyrics %s",
-            queue_item.name,
-            "none" if analysis is None else f"{analysis:.1f}s",
-            "none" if lyrics is None else f"{lyrics:.1f}s",
-        )
-        if lyrics is None:
-            return analysis, "" if analysis is not None else reason
-        # both sources mostly err early: the analysis on a count-in or a burst in the intro,
-        # the lyrics on a credit or ad-lib line. The lyric onset leads, and the analysis
-        # replaces it only when it hears the voice clearly later.
-        if analysis is not None and analysis - lyrics > POST_ANALYSIS_ONSET_LEAD:
-            return analysis, ""
-        return lyrics, ""
-
-    async def _lyric_vocal_onset(self, media_item: Track) -> tuple[float | None, str]:
-        """Return the second the vocal enters per synced lyrics, and the reason when unknown."""
-        if (onset := lyric_onset(media_item.metadata.lrc_lyrics)) is not None:
-            return onset, ""
-        try:
-            # the lookup walks every metadata provider, longer than a clip about to air can wait
-            async with asyncio.timeout(POST_LYRICS_TIMEOUT):
-                plain, lrc_lyrics = await self.mass.metadata.get_track_lyrics(media_item)
-        except TimeoutError:
-            return None, f"lyrics lookup took longer than {POST_LYRICS_TIMEOUT:.0f}s"
-        except MusicAssistantError as err:
-            return None, f"lyrics lookup failed ({err})"
-        if (onset := lyric_onset(lrc_lyrics)) is not None:
-            return onset, ""
-        if lrc_lyrics:
-            return None, "synced lyrics have no sung line"
-        if plain:
-            return None, "only unsynced lyrics available, so no vocal timing"
-        return None, "no lyrics found"
 
     async def _analysis_vocal_onset(self, queue_item: QueueItem) -> float | None:
         """Return the track's vocal onset from its stored audio analysis, or None."""

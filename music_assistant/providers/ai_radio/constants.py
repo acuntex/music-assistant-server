@@ -184,13 +184,10 @@ MIN_PRE_SECONDS = MIN_VOICE_OVER_DURATION
 # so the music is back at full level (the stream controller's ramp) when the vocal enters.
 POST_MIN_SECONDS = 1.5  # shortest overlap worth doing; below it the break plays whole
 POST_MIN_HEAD_SECONDS = 1.0  # the break keeps at least this much before the record comes in
-# MA's lyrics lookup walks every metadata provider; past this budget the break plays whole
-POST_LYRICS_TIMEOUT = 8.0
-# the analysed vocal onset replaces the lyric one only when it is this much later. In blind
-# listening on a real library, the analysis was early far more often than the lyrics were
-# late, and posts timed from the analysis this much later were preferred 9 times out of 10.
-POST_ANALYSIS_ONSET_LEAD = 5.0
-# loading the next record resolves its stream details with its provider; same budget
+# the stored audio analysis is the only onset source; without one the record's intro is
+# assumed to be this long, so the break still lands over it instead of behind it
+POST_DEFAULT_INTRO_SECONDS = 4.0
+# loading the next record resolves its stream details with its provider; this bounds the wait
 POST_LOAD_TIMEOUT = 8.0
 
 # placeholders resolved at render time rather than at plan time, so the aired script
