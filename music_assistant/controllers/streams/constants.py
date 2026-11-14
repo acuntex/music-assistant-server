@@ -209,6 +209,11 @@ MAX_LEAD_OVERLAP: Final[float] = 12.0
 # What a track's tail hold is widened to so a planned lead can be mixed; the voice needs its
 # ramp on top of the lead itself.
 LEAD_HOLD_CEILING: Final[float] = MAX_LEAD_OVERLAP + VOICE_OVER_RAMP
+# Shortest lead a program can still be mixed in: AudioBuffer target + encoder prefill +
+# group buffer, measured.
+LEAD_MIN_LEAD_SECONDS: Final[float] = 2.0
+# Experimental: mix announcements into the running flow stream instead of interrupting it.
+CONF_STREAM_PROGRAM_BUS: Final[str] = "stream_program_bus"
 # QueueItem.extra_attributes keys a provider uses to declare that a clip starts over the
 # tail of the item before it: the seconds, and the item id it was planned against.
 PRE_OVERLAP_ATTR: Final[str] = "ai_radio_pre_overlap"

@@ -106,10 +106,12 @@ from music_assistant.controllers.streams.constants import (
     CACHE_CATEGORY_RESOLVED_RADIO_URL,
     CACHE_PROVIDER,
     CONF_ALLOW_CROSSFADE_SAME_ALBUM,
+    CONF_STREAM_PROGRAM_BUS,
     DEFAULT_VOLUME_NORMALIZATION_MODE,
     HLS_RADIO_INPUT_BURST,
     ICY_PLACEHOLDER_IMAGE_URLS,
     LEAD_HOLD_CEILING,
+    LEAD_MIN_LEAD_SECONDS,
     MIN_VOICE_OVER_DURATION,
     NO_TRACK_MATCH_EXPIRATION,
     NORMALIZATION_LIMITER_CEILING_DB,
@@ -354,25 +356,32 @@ def overlay_mixed_in(queue: PlayerQueue, queue_item: QueueItem, *, flow_mode: bo
     return flow_mode or queue_item.media_type == MediaType.RADIO
 
 
-class _LeadOverlay:
+class _ProgramOverlay:
     """
-    Sum the head of the upcoming clip over the tail of the item that is playing.
+    Sum a scheduled program over the flow's music, starting at an absolute frame.
 
     The music keeps its exact length; it is ducked under the voice where the voice plays and
     the voice is added sample-wise. 32-bit float and 16-bit integer PCM are mixed, anything
-    else passes the music through.
+    else can not be placed at all.
     """
 
-    def __init__(self, voice_pcm: bytes, pcm_format: AudioFormat, start_seconds: float) -> None:
+    def __init__(
+        self,
+        voice_pcm: bytes,
+        pcm_format: AudioFormat,
+        start_frame: int,
+        stop_frame: int | None = None,
+    ) -> None:
         """
-        Prepare the overlay.
+        Prepare the program.
 
-        :param voice_pcm: The clip's head, decoded to the flow's PCM format.
+        :param voice_pcm: The program's audio, decoded to the flow's PCM format.
         :param pcm_format: PCM format of both streams.
-        :param start_seconds: Seconds into the item at which the voice starts.
+        :param start_frame: Frame of the session at which the voice starts.
+        :param stop_frame: Frame the program may not be heard past, if any.
         """
         self._frame_size = (pcm_format.bit_depth // 8) * pcm_format.channels
-        sample_rate = pcm_format.sample_rate
+        self._sample_rate = pcm_format.sample_rate
         if pcm_format.content_type == ContentType.PCM_F32LE and pcm_format.bit_depth == 32:
             self._codec: str | None = "f32"
             self._unpack = struct.Struct(f"<{pcm_format.channels}f").unpack
@@ -383,62 +392,87 @@ class _LeadOverlay:
             self._pack = struct.Struct(f"<{pcm_format.channels}h").pack
         else:
             self._codec = None
-        self._voice = voice_pcm
-        self._voice_frames = len(voice_pcm) // self._frame_size if self._frame_size else 0
-        self._start_frame = max(0, int(start_seconds * sample_rate))
-        ramp = max(1, int(VOICE_OVER_RAMP * sample_rate))
-        self._duck_head = ramp
-        self._duck_tail = ramp
-        self._voice_end = self._start_frame + self._voice_frames
-        self._end_frame = self._voice_end + self._duck_tail
-        self._frame_index = 0
-        self._voice_index = 0
-        self._pending = b""
+        self.label = ""
+        self.voice_pcm = voice_pcm
+        self.voice_frames = len(voice_pcm) // self._frame_size if self._frame_size else 0
+        self.start_frame = max(0, start_frame)
+        ramp = max(1, int(VOICE_OVER_RAMP * self._sample_rate))
+        self.duck_head = ramp
+        self.duck_tail = ramp
+        self._stop_frame = stop_frame
+        self._voice_end = self.start_frame + self.voice_frames
+        self.end_frame = self._end_of(self._voice_end + self.duck_tail)
 
     @property
     def usable(self) -> bool:
         """Return whether there is a voice to mix at all."""
-        return self._codec is not None and self._frame_size > 0 and self._voice_frames > 0
+        return self._codec is not None and self._frame_size > 0 and self.voice_frames > 0
 
-    def mix(self, chunk: bytes) -> bytes:
-        """Return the chunk with the voice summed in where it plays."""
-        if not self.usable:
+    def covers(self, first_frame: int, frames: int) -> bool:
+        """
+        Return whether the given frame range touches the program at all.
+
+        :param first_frame: First frame of the range.
+        :param frames: Number of frames in the range.
+        """
+        return (
+            self.usable and first_frame < self.end_frame and first_frame + frames > self.start_frame
+        )
+
+    def trim_to(self, frame: int) -> bool:
+        """
+        Drop the voice up to the given frame, so a late anchor starts where the flow is.
+
+        :param frame: First frame that is still to be produced.
+        :return: Whether anything of the voice is left to mix.
+        """
+        if frame <= self.start_frame:
+            return True
+        skip = min(frame - self.start_frame, self.voice_frames)
+        self.voice_pcm = self.voice_pcm[skip * self._frame_size :]
+        self.voice_frames -= skip
+        self.start_frame += skip
+        self._voice_end = self.start_frame + self.voice_frames
+        self.end_frame = self._end_of(self._voice_end + self.duck_tail)
+        return self.usable
+
+    def mix(self, chunk: bytes, first_frame: int) -> bytes:
+        """
+        Return the chunk with the voice summed in where it plays.
+
+        :param chunk: One chunk of music, in the flow's PCM format.
+        :param first_frame: Frame of the session the chunk starts at.
+        """
+        if not self.covers(first_frame, len(chunk) // self._frame_size if self._frame_size else 0):
             return chunk
-        if self._frame_index >= self._end_frame:
-            self._frame_index += len(chunk) // self._frame_size
-            return chunk
-        data = self._pending + chunk
-        whole = len(data) - (len(data) % self._frame_size)
-        self._pending = data[whole:]
-        if not whole:
-            return b""
-        out = bytearray()
-        for offset in range(0, whole, self._frame_size):
-            out += self._mix_frame(data[offset : offset + self._frame_size])
-            self._frame_index += 1
+        out = bytearray(chunk)
+        for offset in range(0, len(chunk) - len(chunk) % self._frame_size, self._frame_size):
+            position = first_frame + offset // self._frame_size
+            if self.start_frame <= position < self.end_frame:
+                out[offset : offset + self._frame_size] = self._mix_frame(
+                    chunk[offset : offset + self._frame_size], position
+                )
         return bytes(out)
 
-    def flush(self) -> bytes:
-        """Return the trailing partial frame, if any."""
-        pending, self._pending = self._pending, b""
-        return pending
-
-    def _mix_frame(self, frame: bytes) -> bytes:
-        """Return one frame, ducked and with the voice summed in where it sounds."""
-        position = self._frame_index
-        if position < self._start_frame or position >= self._end_frame:
+    def _end_of(self, frame: int) -> int:
+        """Return the program's end, kept inside the window it may be heard in."""
+        if self._stop_frame is None:
             return frame
+        return max(self.start_frame, min(frame, self._stop_frame))
+
+    def _mix_frame(self, frame: bytes, position: int) -> bytes:
+        """Return one frame, ducked and with the voice summed in where it sounds."""
         depth = VOICE_OVER_DUCK_DEPTH
+        offset = (position - self.start_frame) * self._frame_size
         if position < self._voice_end:
             ducked = depth
         else:
-            ducked = depth * max(0.0, (self._end_frame - position) / self._duck_tail)
+            ducked = depth * max(0.0, (self.end_frame - position) / self.duck_tail)
+            offset = -1
         gain = 1.0 - ducked
         samples = list(self._unpack(frame))
-        offset = self._voice_index * self._frame_size
-        if position < self._voice_end and offset + self._frame_size <= len(self._voice):
-            spoken = self._unpack(self._voice[offset : offset + self._frame_size])
-            self._voice_index += 1
+        if offset >= 0 and offset + self._frame_size <= len(self.voice_pcm):
+            spoken = self._unpack(self.voice_pcm[offset : offset + self._frame_size])
             if self._codec == "f32":
                 for index, value in enumerate(samples):
                     samples[index] = max(-1.0, min(1.0, value * gain + spoken[index]))
@@ -454,22 +488,162 @@ class _LeadOverlay:
         return self._pack(*samples)
 
 
-async def _overlay_lead(
-    music: AsyncGenerator[bytes], overlay: _LeadOverlay
+class _FlowProgramBus:
+    """
+    Mix scheduled programs into the PCM of one flow session.
+
+    The bus counts every frame the session produces and mixes each program while the frame
+    it was scheduled for goes by, so a program needs no stream of its own: the flow is
+    neither restarted nor reopened, no second ffmpeg input is used and every chunk leaves
+    the bus with exactly the length and the size it came in with.
+    """
+
+    def __init__(self, pcm_format: AudioFormat, logger: logging.Logger) -> None:
+        """
+        Initialize the bus for one flow session.
+
+        :param pcm_format: PCM format the flow produces.
+        :param logger: Logger of the audio sub-controller.
+        """
+        self._pcm_format = pcm_format
+        self._logger = logger
+        self._frame_size = (pcm_format.bit_depth // 8) * pcm_format.channels
+        self.produced_frames = 0
+        self._overlays: list[_ProgramOverlay] = []
+
+    @property
+    def active(self) -> bool:
+        """Return whether a scheduled program is still to be heard."""
+        return bool(self._overlays)
+
+    def schedule(
+        self,
+        pcm: bytes,
+        start_frame: int | None,
+        *,
+        label: str,
+        stop_frame: int | None = None,
+    ) -> int | None:
+        """
+        Place a program at a frame of the session.
+
+        A frame that was already produced can not be mixed any more: the program is moved
+        forward to the current frame (and logged as late) or dropped when its whole window
+        has already gone by.
+
+        :param pcm: The program's audio, in the flow's PCM format.
+        :param start_frame: Frame the voice starts at, or None to start at the current frame.
+        :param label: Name of the program, for the log.
+        :param stop_frame: Frame the program may not be heard past, if any. A program that
+            ends where an item ends is kept inside that item, so its duck ramp can not leak
+            into the item after it.
+        :return: The frame it was anchored at, or None when it can not be mixed.
+        """
+        if not pcm or not self._frame_size:
+            self._logger.debug("PROGRAM-BUS schedule label=%s dropped: no audio", label)
+            return None
+        anchor = self.produced_frames if start_frame is None else start_frame
+        overlay = _ProgramOverlay(pcm, self._pcm_format, anchor, stop_frame)
+        overlay.label = label
+        if not overlay.usable:
+            self._logger.debug(
+                "PROGRAM-BUS schedule label=%s dropped: %s can not be mixed",
+                label,
+                self._pcm_format.content_type,
+            )
+            return None
+        clamp = max(0, self.produced_frames - overlay.start_frame)
+        if clamp and not overlay.trim_to(self.produced_frames):
+            self._logger.debug(
+                "PROGRAM-BUS schedule label=%s dropped: its whole window was already produced",
+                label,
+            )
+            return None
+        self._overlays.append(overlay)
+        self._logger.debug(
+            "PROGRAM-BUS schedule label=%s anchor=%d clamp=%d",
+            label,
+            overlay.start_frame,
+            clamp,
+        )
+        if clamp:
+            self._logger.debug(
+                "PROGRAM-BUS schedule label=%s started late by %.3fs",
+                label,
+                clamp / max(self._pcm_format.sample_rate, 1),
+            )
+        return overlay.start_frame
+
+    def feed(self, chunk: bytes) -> bytes:
+        """
+        Mix the programs that are due into the chunk, keeping its length and its size.
+
+        :param chunk: One chunk of music, in the flow's PCM format.
+        """
+        first_frame = self.produced_frames
+        frames = len(chunk) // self._frame_size if self._frame_size else 0
+        output = chunk
+        for overlay in self._overlays:
+            if overlay.covers(first_frame, frames):
+                output = overlay.mix(output, first_frame)
+        self.produced_frames = first_frame + frames
+        if self._overlays:
+            overdue = [overlay for overlay in self._overlays if overlay.end_frame <= first_frame]
+            if overdue:
+                self._overlays = [
+                    overlay for overlay in self._overlays if overlay.end_frame > first_frame
+                ]
+                if not self._overlays:
+                    self._logger.debug("PROGRAM-BUS drained at frame %d", self.produced_frames)
+        return output
+
+    def cancel_all(self, reason: str) -> None:
+        """
+        Drop every program that is still to be heard.
+
+        :param reason: Why they are dropped, for the log.
+        """
+        if not self._overlays:
+            return
+        self._overlays.clear()
+        self._logger.debug("PROGRAM-BUS cancel reason=%s", reason)
+
+    def drop_unreached(self, label_prefix: str, reason: str) -> None:
+        """
+        Drop programs of the given label that are still ahead of the produced frames.
+
+        :param label_prefix: Label prefix the dropped programs share.
+        :param reason: Why they are dropped, for the log.
+        """
+        remaining = [
+            overlay
+            for overlay in self._overlays
+            if overlay.label.startswith(label_prefix)
+            and overlay.start_frame >= self.produced_frames
+        ]
+        if not remaining:
+            return
+        self._overlays = [overlay for overlay in self._overlays if overlay not in remaining]
+        self._logger.debug(
+            "PROGRAM-BUS cancel reason=%s label=%s", reason, ",".join(o.label for o in remaining)
+        )
+
+
+async def _through_program_bus(
+    music: AsyncGenerator[bytes], program_bus: _FlowProgramBus
 ) -> AsyncGenerator[bytes]:
     """
-    Mix the overlay into the item's stream, keeping its length and chunk size intact.
+    Run an item's audio through the session's program bus.
 
     :param music: The item's own stream.
-    :param overlay: The prepared clip head.
+    :param program_bus: The session's program bus.
     """
-    async for chunk in music:
-        mixed = overlay.mix(chunk)
-        if mixed:
-            yield mixed
-    tail = overlay.flush()
-    if tail:
-        yield tail
+    try:
+        async for chunk in music:
+            yield program_bus.feed(chunk)
+    finally:
+        # closing this wrapper has to release the decoder underneath it as well
+        await music.aclose()
 
 
 def tail_hold_target(queue_item: QueueItem, max_bytes: int, frame_size: int) -> int:
@@ -2858,6 +3032,13 @@ class StreamsAudio:
 
         queue_exhausted = False
         incoming_prefetcher = _IncomingFadePrefetcher(self, pcm_format, flow_session_id)
+        # read once per session: the switch decides whether this flow mixes programs at all
+        program_bus: _FlowProgramBus | None = None
+        if self.mass.streams.get_config_value(CONF_STREAM_PROGRAM_BUS, False, return_type=bool):
+            program_bus = _FlowProgramBus(pcm_format, self.logger)
+            self.logger.debug(
+                "PROGRAM-BUS session %s opened for queue %s", flow_session_id, queue.display_name
+            )
         try:
             while True:
                 # bail out early if a newer producer has taken over this queue,
@@ -3189,17 +3370,19 @@ class StreamsAudio:
                         session_id=flow_session_id,
                         prepared_buffer=incoming_audio_buffer,
                     )
-                # a clip may start over this item's tail: mix its head in while this one ends
-                lead_overlay = await self._prepare_lead_overlay(
-                    queue.queue_id,
-                    queue_track,
-                    pcm_format,
-                    raw_seek_position,
-                    track_playback_speed,
-                    incoming_prefetcher,
-                )
-                if lead_overlay is not None:
-                    item_stream = _overlay_lead(item_stream, lead_overlay)
+                # a clip may start over this item's tail: place its head on the session's
+                # program bus, anchored at the frame this item ends on
+                if program_bus is not None:
+                    await self._schedule_program_lead(
+                        program_bus,
+                        queue.queue_id,
+                        queue_track,
+                        pcm_format,
+                        raw_seek_position,
+                        track_playback_speed,
+                        incoming_prefetcher,
+                    )
+                    item_stream = _through_program_bus(item_stream, program_bus)
 
                 # closing here releases the decoders on an early exit,
                 # instead of leaving them to the garbage collector
@@ -3437,6 +3620,13 @@ class StreamsAudio:
                     )
                     return
 
+                if program_bus is not None:
+                    # a lead this item never reached would otherwise play over the item
+                    # after it, where it does not belong
+                    program_bus.drop_unreached(
+                        f"lead:{queue_track.queue_item_id}", "item ended before its anchor"
+                    )
+
                 # A source error after partial audio must not look like a completed item.
                 # Progress reporting skips items with stream_error, so the item is not
                 # marked played; move on to the next queue item like the zero-audio path.
@@ -3583,6 +3773,8 @@ class StreamsAudio:
                     queue.display_name,
                 )
         finally:
+            if program_bus is not None:
+                program_bus.cancel_all("flow stream ended")
             await incoming_prefetcher.close()
         #### HANDLE END OF QUEUE FLOW STREAM
         # skip end-of-queue bookkeeping if a newer producer has superseded us;
@@ -5329,21 +5521,24 @@ class StreamsAudio:
             return None
         return handover
 
-    async def _prepare_lead_overlay(
+    async def _schedule_program_lead(
         self,
+        program_bus: _FlowProgramBus,
         queue_id: str,
         queue_track: QueueItem,
         pcm_format: AudioFormat,
         seek_position: float,
         playback_speed: float,
         incoming_prefetcher: _IncomingFadePrefetcher,
-    ) -> _LeadOverlay | None:
+    ) -> int | None:
         """
-        Return the overlay that starts the next clip over this item's tail, if one is planned.
+        Place the next clip's head on the program bus at the frame this item ends on.
 
-        The clip's head is taken out of the stream it will continue on, so it is decoded once:
-        the overlay plays it here and the clip's own stream carries on from past it.
+        The head is taken out of the stream the clip continues on, so the clip is decoded
+        once: the bus plays it over this item's tail and the clip's own stream carries on
+        from past it, reported from the media time it is really heard at.
 
+        :param program_bus: The session's program bus.
         :param queue_id: The queue the item plays on.
         :param queue_track: The item that is playing.
         :param pcm_format: The flow's PCM format.
@@ -5372,9 +5567,21 @@ class StreamsAudio:
                 )
                 return None
         remaining_media = streamdetails.duration - seek_position
+        speed = max(playback_speed, 1e-6)
         if remaining_media <= 0:
             return None
-        lead_seconds = min(lead_seconds, remaining_media / max(playback_speed, 1e-6))
+        lead_seconds = min(lead_seconds, remaining_media / speed)
+        if lead_seconds < LEAD_MIN_LEAD_SECONDS:
+            # the head has to travel through the buffer and the encoder before the item
+            # ends; a shorter lead can not be mixed in time and plays as a plain cut
+            self.logger.debug(
+                "Not starting %s over %s: only %.2fs of lead are left, %.1fs are needed",
+                next_item.name,
+                queue_track.name,
+                lead_seconds,
+                LEAD_MIN_LEAD_SECONDS,
+            )
+            return None
         voice_pcm = await incoming_prefetcher.collect_head(next_item, lead_seconds)
         if not voice_pcm:
             self.logger.debug(
@@ -5383,22 +5590,32 @@ class StreamsAudio:
                 queue_track.name,
             )
             return None
-        start_seconds = max(0.0, (remaining_media - lead_seconds) / max(playback_speed, 1e-6))
+        item_end_frame = program_bus.produced_frames + int(
+            remaining_media / speed * pcm_format.sample_rate
+        )
+        anchor = item_end_frame - int(lead_seconds * pcm_format.sample_rate)
         self.logger.info(
             "Starting %s over the last %.1fs of %s", next_item.name, lead_seconds, queue_track.name
         )
         # DEBUG-INSTRUMENTATION (ci branch): the head that goes into the running flow
         self.logger.debug(
-            "LEAD-OVERLAY arm out=%s(%s) clip=%s(%s) lead=%.2fs start=%.2fs head=%dB",
+            "LEAD-OVERLAY arm out=%s(%s) clip=%s(%s) lead=%.2fs start=%.2fs head=%dB anchor=%d",
             queue_track.queue_item_id,
             queue_track.media_type,
             next_item.queue_item_id,
             next_item.media_type,
             lead_seconds,
-            start_seconds,
+            (remaining_media - lead_seconds) / speed,
             len(voice_pcm),
+            anchor,
         )
-        return _LeadOverlay(voice_pcm, pcm_format, start_seconds)
+        # the voice has to end where this item ends, so its duck ramp stays inside it
+        return program_bus.schedule(
+            voice_pcm,
+            anchor,
+            label=f"lead:{next_item.queue_item_id}",
+            stop_frame=item_end_frame,
+        )
 
     @staticmethod
     def _planned_lead(queue_item: QueueItem | None, outgoing_item_id: str) -> float | None:

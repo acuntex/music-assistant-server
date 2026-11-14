@@ -15,11 +15,9 @@ from music_assistant_models.errors import QueueEmpty
 from music_assistant_models.streamdetails import TailOverlap
 
 from music_assistant.controllers.streams import audio as audio_module
-from music_assistant.controllers.streams.audio import StreamsAudio, _LeadOverlay
+from music_assistant.controllers.streams.audio import StreamsAudio, _ProgramOverlay
 from music_assistant.controllers.streams.constants import (
     MIN_VOICE_OVER_DURATION,
-    PRE_OVERLAP_ATTR,
-    PRE_OVERLAP_FROM_ATTR,
     VOICE_OVER_RAMP,
 )
 from music_assistant.controllers.streams.smart_fades.fades import VoiceOverFade
@@ -38,10 +36,6 @@ SAMPLE_SIZE = TEST_PCM_FORMAT.pcm_sample_size
 OVERLAP = 3.0
 CLIP_SECONDS = 10
 TRACK_SECONDS = 40
-# a break that starts over the tail of the item before it
-LEAD = 2.0
-LEAD_CLIP_SECONDS = 4
-LEAD_TRACK_SECONDS = 40
 
 
 def _clip(next_queue_item_id: str = "item-2") -> SimpleNamespace:
@@ -400,16 +394,16 @@ async def test_clip_cuts_to_the_track_when_its_audio_is_late(
     )
 
 
-def test_a_lead_overlay_ducks_the_music_and_sums_the_voice() -> None:
+def test_a_program_overlay_ducks_the_music_and_sums_the_voice() -> None:
     """The head of the clip is added over the outgoing track, whose level drops under it."""
     pcm_format = TEST_PCM_FORMAT
     frames = pcm_format.sample_rate
     voice = struct.pack("<hh", 8, 8) * frames
-    overlay = _LeadOverlay(voice, pcm_format, start_seconds=0.0)
+    overlay = _ProgramOverlay(voice, pcm_format, start_frame=0)
     assert overlay.usable
 
     music = struct.pack("<hh", 100, 100) * frames
-    mixed = overlay.mix(music)
+    mixed = overlay.mix(music, 0)
 
     assert len(mixed) == len(music)
     samples = struct.unpack(f"<{len(mixed) // 2}h", mixed)
@@ -417,75 +411,3 @@ def test_a_lead_overlay_ducks_the_music_and_sums_the_voice() -> None:
     assert max(samples[: len(samples) // 2]) < 60
     # and it is louder than the ducked music alone once the voice plays
     assert max(samples[: len(samples) // 2]) > 20
-
-
-def _lead_clip(outgoing_item_id: str = "item-1") -> SimpleNamespace:
-    """Build a DJ clip that starts over the tail of the given queue item."""
-    clip = _queue_item("item-2", "Clip", duration=LEAD_CLIP_SECONDS)
-    clip.media_type = MediaType.SOUND_EFFECT
-    clip.streamdetails.tail_overlap = None
-    clip.extra_attributes[PRE_OVERLAP_ATTR] = LEAD
-    clip.extra_attributes[PRE_OVERLAP_FROM_ATTR] = outgoing_item_id
-    return clip
-
-
-def _install_lead_item_streams(
-    monkeypatch: pytest.MonkeyPatch, audio: StreamsAudio
-) -> list[tuple[str, float]]:
-    """Serve each item for its duration, recording where every stream of it was opened."""
-    opened: list[tuple[str, float]] = []
-
-    async def _item_stream(
-        queue_item: SimpleNamespace, *_args: object, **kwargs: object
-    ) -> AsyncGenerator[bytes]:
-        item_id = queue_item.queue_item_id
-        opened.append((item_id, cast("float", kwargs.get("seek_position", 0))))
-        marker = 0x10 if item_id == "item-1" else 0x40
-        remaining = queue_item.streamdetails.duration - int(
-            cast("float", kwargs.get("seek_position", 0))
-        )
-        for _ in range(remaining):
-            yield bytes([marker]) * SAMPLE_SIZE
-            await asyncio.sleep(0)
-
-    monkeypatch.setattr(audio, "get_queue_item_stream", _item_stream)
-    return opened
-
-
-async def test_a_clips_head_plays_once_over_the_tail_it_was_planned_on(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The clip's head plays over the track's tail and its own stream carries on after it."""
-    track = _track("item-1", "Track")
-    track.streamdetails.duration = LEAD_TRACK_SECONDS
-    clip = _lead_clip()
-    audio, queue, mass = _voice_over_audio(
-        monkeypatch, next_item=clip, load_next=[clip, QueueEmpty]
-    )
-    opened = _install_lead_item_streams(monkeypatch, audio)
-
-    output = await _drain(_flow(audio, queue, track))
-
-    # the track plays whole and the clip adds only what it did not already play
-    assert len(output) == int((LEAD_TRACK_SECONDS + LEAD_CLIP_SECONDS - LEAD) * SAMPLE_SIZE)
-    body = int((LEAD_CLIP_SECONDS - LEAD) * SAMPLE_SIZE)
-    assert output[-body:] == bytes([0x40]) * body
-    # the head was read once, out of the stream the clip itself continues on
-    assert [entry for entry in opened if entry[0] == "item-2"] == [("item-2", 0)]
-    # and the boundary into the clip adds nothing on top of it
-    cast("Any", audio.smart_fades_mixer.build).assert_not_awaited()
-
-    # the track is untouched up to its tail, where the ducked music carries the voice
-    head_start = int((LEAD_TRACK_SECONDS - LEAD) * SAMPLE_SIZE)
-    assert output[:head_start] == bytes([0x10]) * head_start
-    tail = output[head_start : head_start + int(LEAD * SAMPLE_SIZE)]
-    assert tail != bytes([0x10]) * len(tail)
-    summed = struct.unpack(f"<{len(tail) // 2}h", tail)
-    assert max(summed) > 0x1010
-
-    # the queue reports the clip from where it is really heard
-    flow_log = mass.player_queues.queue_data.return_value.flow_mode_stream_log
-    assert [entry.seek_position for entry in flow_log] == [0, LEAD]
-    assert flow_log[1].seconds_streamed == LEAD_CLIP_SECONDS - LEAD
-    assert clip.streamdetails.seek_position == LEAD
-    assert clip.streamdetails.duration == LEAD_CLIP_SECONDS

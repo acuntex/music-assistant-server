@@ -91,6 +91,7 @@ from music_assistant.controllers.streams.constants import (
     CONF_BUFFER_SIZE,
     CONF_BUFFER_SIZE_DEFAULT,
     CONF_SMART_FADES_LOG_LEVEL,
+    CONF_STREAM_PROGRAM_BUS,
     CONF_STREAM_SOURCE_MODE,
     CONF_UPGRADE_BELOW_QUALITY,
     DEFAULT_PORT,
@@ -629,6 +630,16 @@ class StreamsController(CoreController):
                 type=ConfigEntryType.BOOLEAN,
                 default_value=False,
                 category="playback",
+            ),
+            ConfigEntry(
+                key=CONF_STREAM_PROGRAM_BUS,
+                type=ConfigEntryType.BOOLEAN,
+                default_value=False,
+                label="Experimentell: Ansagen mitten im Track (Program-Bus)",
+                description="Mischt Ansagen in den laufenden Stream, statt die Wiedergabe "
+                "zu unterbrechen",
+                category="playback",
+                advanced=True,
             ),
             ConfigEntry(
                 key=CONF_STREAM_SOURCE_MODE,
