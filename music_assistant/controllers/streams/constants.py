@@ -212,6 +212,10 @@ LEAD_HOLD_CEILING: Final[float] = MAX_LEAD_OVERLAP + VOICE_OVER_RAMP
 # Shortest lead a program can still be mixed in: AudioBuffer target + encoder prefill +
 # group buffer, measured.
 LEAD_MIN_LEAD_SECONDS: Final[float] = 2.0
+# How much more than the tail overlap it declared a clip may still deliver and be carried
+# over the boundary whole. The plan splits a clip into a head and a tail overlap, and an
+# item's declared duration is a whole-second estimate, so a little more audio is expected.
+BUS_CLIP_CARRY_SLACK: Final[float] = 2.0
 # Experimental: mix announcements into the running flow stream instead of interrupting it.
 CONF_STREAM_PROGRAM_BUS: Final[str] = "stream_program_bus"
 # QueueItem.extra_attributes keys a provider uses to declare that a clip starts over the

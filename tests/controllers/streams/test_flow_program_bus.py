@@ -17,15 +17,17 @@ from music_assistant_models.enums import (
     ContentType,
     CrossfadeMode,
     MediaType,
+    PlaybackState,
     StreamType,
     VolumeNormalizationMode,
 )
 from music_assistant_models.errors import QueueEmpty
 from music_assistant_models.media_items import AudioFormat
 from music_assistant_models.queue_item import QueueItem
-from music_assistant_models.streamdetails import StreamDetails
+from music_assistant_models.streamdetails import StreamDetails, TailOverlap
 
 from music_assistant.constants import FLOW_MODE_SAMPLE_RATE_SMART
+from music_assistant.controllers.player_queues.controller import PlayerQueuesController
 from music_assistant.controllers.streams.audio import (
     StreamsAudio,
     _FlowProgramBus,
@@ -1097,3 +1099,207 @@ def test_a_taken_head_still_counts_once_the_item_is_resolved_again() -> None:
         provider="ai_radio", item_id="clip_2", audio_format=TEST_PCM_FORMAT
     )
     assert prefetcher.head_mixed(clip) is None
+
+
+COVERED_CLIP_SECONDS = 4
+COVERED_HEAD = 2.0
+COVERED_POST = 2.0
+# the marker each item's audio carries, so the output can be read per item
+ITEM_SECONDS = {"item-1": LEAD_TRACK_SECONDS, "item-2": COVERED_CLIP_SECONDS, "item-3": 200}
+ITEM_MARKERS = {"item-1": 0x10, "item-2": 0x40, "item-3": 0x50}
+
+
+def _covered_clip() -> SimpleNamespace:
+    """Build a DJ clip whose head and tail overlap together cover all of it."""
+    clip = _queue_item("item-2", "Transition", duration=COVERED_CLIP_SECONDS)
+    clip.media_type = MediaType.SOUND_EFFECT
+    clip.extra_attributes[PRE_OVERLAP_ATTR] = COVERED_HEAD
+    clip.extra_attributes[PRE_OVERLAP_FROM_ATTR] = "item-1"
+    clip.streamdetails.tail_overlap = TailOverlap(
+        duration=COVERED_POST, next_queue_item_id="item-3"
+    )
+    return clip
+
+
+def _summing_mix(monkeypatch: pytest.MonkeyPatch, audio: StreamsAudio) -> list[tuple[bytes, bytes]]:
+    """
+    Replace the mixer with the shape a voice over really has: one side is summed in.
+
+    The side that carries the music keeps its own length, so the flow's length is exactly what
+    it would really be, and both sides of every boundary can be read afterwards.
+    """
+    mixes: list[tuple[bytes, bytes]] = []
+
+    async def _mix(
+        _smart_fade: object,
+        *,
+        fade_in_part: bytes | AsyncGenerator[bytes],
+        fade_out_part: bytes,
+        **_kwargs: object,
+    ) -> AsyncGenerator[bytes]:
+        if isinstance(fade_in_part, bytes):
+            fade_in_bytes = fade_in_part
+        else:
+            fade_in_bytes = b"".join([chunk async for chunk in fade_in_part])
+        mixes.append((fade_out_part, fade_in_bytes))
+        # the music side of the blend is the longer one: the voice is summed into it
+        yield fade_out_part if len(fade_out_part) >= len(fade_in_bytes) else fade_in_bytes
+
+    monkeypatch.setattr(audio.smart_fades_mixer, "mix", _mix)
+    return mixes
+
+
+def _covered_clip_flow(
+    monkeypatch: pytest.MonkeyPatch, *, program_bus: bool
+) -> tuple[
+    StreamsAudio,
+    SimpleNamespace,
+    MagicMock,
+    SimpleNamespace,
+    SimpleNamespace,
+    SimpleNamespace,
+    list[Any],
+]:
+    """Build a flow of track -> covered clip -> track, marking each item's audio."""
+    track = _queue_item("item-1", "Track", duration=LEAD_TRACK_SECONDS)
+    clip = _covered_clip()
+    after = _queue_item("item-3", "After", duration=ITEM_SECONDS["item-3"])
+    audio, queue, mass = _flow_audio(
+        monkeypatch,
+        next_item=clip,
+        load_next=[clip, after, QueueEmpty],
+        program_bus=program_bus,
+        build_result=SimpleNamespace(
+            timing_info=SimpleNamespace(
+                fadein_trimmed_duration=0.0,
+                crossfade_duration=COVERED_POST,
+                pre_crossfade_duration=0.0,
+            )
+        ),
+    )
+    mixes = _summing_mix(monkeypatch, audio)
+    # the real rule decides whether a declared lead applies
+    del audio.crossfade_allowed
+    next_items = {"item-1": clip, "item-2": after}
+    mass.player_queues.get_next_item.side_effect = lambda _queue_id, item_id: next_items.get(
+        item_id
+    )
+    opened: list[tuple[str, float]] = []
+
+    async def _item_stream(
+        queue_item: SimpleNamespace, *_args: object, **kwargs: object
+    ) -> AsyncGenerator[bytes]:
+        item_id = queue_item.queue_item_id
+        opened.append((item_id, cast("float", kwargs.get("seek_position", 0))))
+        remaining = ITEM_SECONDS[item_id] - int(cast("float", kwargs.get("seek_position", 0)))
+        for _ in range(max(0, remaining)):
+            yield bytes([ITEM_MARKERS[item_id]]) * SAMPLE_SIZE
+            await asyncio.sleep(0)
+
+    monkeypatch.setattr(audio, "get_queue_item_stream", _item_stream)
+    return audio, queue, mass, track, clip, after, [opened, mixes]
+
+
+async def test_a_covered_clip_is_carried_over_the_boundary_without_a_gap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clip that its head and post cover whole is summed into the boundary, not served."""
+    audio, queue, mass, track, clip, _after, captured = _covered_clip_flow(
+        monkeypatch, program_bus=True
+    )
+    opened, mixes = captured
+
+    output = await _drain(_flow(audio, queue, track))
+
+    second = SAMPLE_SIZE
+    track_bytes = LEAD_TRACK_SECONDS * second
+    head_bytes = int(COVERED_HEAD * second)
+    # the track plays whole, with the clip's head over its last seconds ...
+    assert output[: track_bytes - head_bytes] == bytes([0x10]) * (track_bytes - head_bytes)
+    assert output[track_bytes - head_bytes : track_bytes] != bytes([0x10]) * head_bytes
+    # ... and the track after it owns every byte from the boundary on: no hole, no silence
+    assert output[track_bytes:] == bytes([0x50]) * (len(output) - track_bytes)
+    # the flow is exactly the two tracks long; the clip's voice is summed into them
+    assert len(output) == (LEAD_TRACK_SECONDS + ITEM_SECONDS["item-3"]) * second
+    # the clip was read once, as a whole, and never opened a second time as an item
+    assert [entry for entry in opened if entry[0] == "item-2"] == [("item-2", 0)]
+    # its remaining audio is the mixed side of the boundary into the track after it
+    carried = COVERED_CLIP_SECONDS - int(COVERED_HEAD)
+    assert len(mixes) == 1
+    assert mixes[0][0] == bytes([0x40]) * (carried * second)
+    build = cast("Any", audio.smart_fades_mixer.build).await_args
+    assert build.kwargs["mode"] == CrossfadeMode.VOICE_OVER
+    assert build.kwargs["lead"] is False
+    # and it is no item of this flow: the play log names only the two tracks
+    flow_log = mass.player_queues.queue_data.return_value.flow_mode_stream_log
+    assert [entry.queue_item_id for entry in flow_log] == ["item-1", "item-3"]
+    assert [entry.seconds_streamed for entry in flow_log] == [
+        LEAD_TRACK_SECONDS,
+        ITEM_SECONDS["item-3"],
+    ]
+    # the clip keeps its own length; nothing of it was written back as another item's
+    assert clip.streamdetails.duration == COVERED_CLIP_SECONDS
+    assert clip.duration == COVERED_CLIP_SECONDS
+
+
+async def test_the_now_playing_stays_the_track_while_a_covered_clip_plays(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The queue never reports a clip that is only heard over the tracks around it."""
+    audio, queue, mass, track, clip, after, _captured = _covered_clip_flow(
+        monkeypatch, program_bus=True
+    )
+
+    await _drain(_flow(audio, queue, track))
+
+    data = mass.player_queues.queue_data.return_value
+    data.items = [track, clip, after]
+    queue.current_index = 0
+    controller = PlayerQueuesController.__new__(PlayerQueuesController)
+    controller._queue_data = {queue.queue_id: data}
+
+    def _position(elapsed: float) -> tuple[int | None, float]:
+        player = SimpleNamespace(
+            state=SimpleNamespace(
+                corrected_elapsed_time=elapsed, playback_state=PlaybackState.PLAYING
+            )
+        )
+        return controller._get_flow_queue_stream_index(cast("Any", queue), cast("Any", player))
+
+    # the clip's head plays over the track, and the track is what the player shows
+    assert _position(LEAD_TRACK_SECONDS - COVERED_HEAD)[0] == 0
+    # at the boundary the position moves on to the track after it, never to the clip
+    assert _position(LEAD_TRACK_SECONDS + 0.5)[0] == 2
+    assert _position(LEAD_TRACK_SECONDS + 5)[0] == 2
+    # the position runs forward inside each item, and no item is ever skipped backwards
+    indexes = [_position(elapsed)[0] for elapsed in (39.0, 39.5, 40.5, 41.0, 42.0)]
+    assert indexes == [0, 0, 2, 2, 2]
+    within_after = [_position(elapsed)[1] for elapsed in (40.5, 41.0, 42.0)]
+    assert within_after == sorted(within_after)
+
+
+async def test_a_covered_clip_is_served_as_an_item_when_the_program_bus_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without the bus there is no head, so the clip is an item of the queue as before."""
+    audio, queue, mass, track, _clip, _after, captured = _covered_clip_flow(
+        monkeypatch, program_bus=False
+    )
+    opened, mixes = captured
+
+    output = await _drain(_flow(audio, queue, track))
+
+    # nothing was carried over the boundary; the clip is opened and served as its own item
+    assert [entry for entry in opened if entry[0] == "item-2"] == [("item-2", 0)]
+    flow_log = mass.player_queues.queue_data.return_value.flow_mode_stream_log
+    assert [entry.queue_item_id for entry in flow_log] == ["item-1", "item-2", "item-3"]
+    assert flow_log[1].seconds_streamed
+    # both of its boundaries are mixed as they always were: its head is the fade-in over the
+    # track before it, and its held tail the fade-out into the track after it
+    second = SAMPLE_SIZE
+    head = int(COVERED_HEAD * second)
+    assert len(mixes) == 2
+    assert mixes[0][1] == bytes([0x40]) * head
+    assert mixes[1][0] == bytes([0x40]) * (COVERED_CLIP_SECONDS * second - head)
+    # and the flow is exactly the two tracks long: the clip is summed into both boundaries
+    assert len(output) == (LEAD_TRACK_SECONDS + ITEM_SECONDS["item-3"]) * second
