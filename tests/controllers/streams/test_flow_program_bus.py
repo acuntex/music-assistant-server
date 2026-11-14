@@ -7,16 +7,28 @@ import struct
 from collections.abc import AsyncGenerator
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from music_assistant_models.enums import ContentType, MediaType
+from aiohttp import web
+from aiohttp.test_utils import make_mocked_request
+from music_assistant_models.enums import (
+    ContentType,
+    CrossfadeMode,
+    MediaType,
+    StreamType,
+    VolumeNormalizationMode,
+)
 from music_assistant_models.errors import QueueEmpty
 from music_assistant_models.media_items import AudioFormat
+from music_assistant_models.queue_item import QueueItem
+from music_assistant_models.streamdetails import StreamDetails
 
+from music_assistant.constants import FLOW_MODE_SAMPLE_RATE_SMART
 from music_assistant.controllers.streams.audio import (
     StreamsAudio,
     _FlowProgramBus,
+    _ProgramLead,
 )
 from music_assistant.controllers.streams.constants import (
     CONF_STREAM_PROGRAM_BUS,
@@ -24,12 +36,17 @@ from music_assistant.controllers.streams.constants import (
     PRE_OVERLAP_FROM_ATTR,
     VOICE_OVER_RAMP,
 )
-from music_assistant.controllers.streams.smart_fades.filters import VOICE_OVER_DUCK_DEPTH
+from music_assistant.controllers.streams.controller import StreamsController
+from music_assistant.controllers.streams.smart_fades.filters import (
+    MIX_CEILING_DB,
+    VOICE_OVER_DUCK_DEPTH,
+)
 from tests.controllers.streams.test_crossfade_transition import (
     TEST_PCM_FORMAT,
     _flow_audio,
     _queue_item,
 )
+from tests.controllers.streams.test_flow_format import _make_player, _make_streams_audio
 
 SAMPLE_SIZE = TEST_PCM_FORMAT.pcm_sample_size
 SECOND = TEST_PCM_FORMAT.sample_rate
@@ -85,8 +102,11 @@ def test_a_program_is_mixed_from_its_anchor_on_without_changing_the_length() -> 
     assert output[1] != _music(1.0)
     assert output[2] != _music(1.0)
     mixed = _levels(output[1])
-    # the music is ducked and the voice summed on top of it
-    assert max(mixed) == int(100 * (1 - VOICE_OVER_DUCK_DEPTH)) + 8
+    # the music is pulled down over the ramp, then ducked with the voice summed on top
+    assert mixed[0] > int(100 * (1 - VOICE_OVER_DUCK_DEPTH)) + 8
+    ducked_from = int(VOICE_OVER_RAMP * SECOND)
+    assert mixed[ducked_from] == int(100 * (1 - VOICE_OVER_DUCK_DEPTH)) + 8
+    assert max(mixed[ducked_from:]) == int(100 * (1 - VOICE_OVER_DUCK_DEPTH)) + 8
     # and once the voice has ramped out, the music is untouched again
     assert output[4] == _music(1.0)
     # the tail ramp makes the program outlast its voice, then it falls out of the bus
@@ -388,7 +408,9 @@ def test_the_overlay_keeps_its_frame_size_for_float_pcm() -> None:
 
     mixed = bus.feed(struct.pack("<ff", 0.5, 0.5) * 8000)
 
-    samples = struct.unpack("<f", mixed[:4])
+    # past the duck-in ramp the music is at full duck, with the voice summed on top
+    offset = int(VOICE_OVER_RAMP * pcm_format.sample_rate) * 8
+    samples = struct.unpack("<f", mixed[offset : offset + 4])
     assert samples[0] == pytest.approx(0.5 * (1 - VOICE_OVER_DUCK_DEPTH) + 0.1, abs=1e-6)
 
 
@@ -412,3 +434,344 @@ async def test_a_lead_shorter_than_the_measured_minimum_is_not_placed(
 
     track_bytes = int(LEAD_TRACK_SECONDS * SAMPLE_SIZE)
     assert output[:track_bytes] == bytes([0x10]) * track_bytes
+
+
+def test_the_music_is_pulled_down_over_the_duck_ramp() -> None:
+    """The music fades in to the duck over the same ramp the boundary's voice-over uses."""
+    bus = _bus()
+    bus.schedule(_voice(1.0), 0, label="test")
+
+    levels = _levels(bus.feed(_music(2.0)))
+
+    full = 100
+    ducked = int(100 * (1 - VOICE_OVER_DUCK_DEPTH)) + 8
+    ramp = int(VOICE_OVER_RAMP * SECOND)
+    # the first frame is still (nearly) at full level, the ramp ends on the ducked level
+    assert ducked < levels[ramp // 2] < levels[0] <= full + 8
+    assert levels[ramp] == ducked
+    assert levels[ramp + 1] == ducked
+
+
+def test_a_full_scale_voice_over_full_scale_music_does_not_clip() -> None:
+    """Summing a full-scale voice over full-scale music saturates below full scale."""
+    pcm_format = AudioFormat(
+        content_type=ContentType.PCM_F32LE,
+        sample_rate=8000,
+        bit_depth=32,
+        channels=2,
+    )
+    bus = _FlowProgramBus(pcm_format, cast("Any", MagicMock()))
+    music = struct.pack("<ff", 1.0, 1.0) * 8000
+    bus.schedule(struct.pack("<ff", 1.0, 1.0) * 8000, 0, label="test")
+
+    mixed = bus.feed(music)
+
+    samples = struct.unpack(f"<{len(mixed) // 4}f", mixed)
+    # not a single sample leaves full scale, so nothing wraps or turns into a NaN
+    assert max(samples) <= 1.0
+    assert min(samples) >= -1.0
+    # the sum is held at the ceiling the boundary's voice-over limiter uses
+    assert max(samples) == pytest.approx(10 ** (MIX_CEILING_DB / 20), abs=1e-6)
+    assert len(mixed) == len(music)
+
+
+def test_a_full_scale_voice_over_full_scale_music_saturates_in_sixteen_bit() -> None:
+    """The 16-bit mix saturates instead of wrapping around at full scale."""
+    bus = _bus()
+    music = struct.pack("<hh", 32767, 32767) * SECOND
+    bus.schedule(struct.pack("<hh", 32767, 32767) * SECOND, 0, label="test")
+
+    mixed = bus.feed(music)
+
+    levels = list(struct.unpack(f"<{len(mixed) // 2}h", mixed))
+    assert max(levels) == 32767
+    assert min(levels) >= -32768
+    assert len(mixed) == len(music)
+
+
+DRIFT_REAL_SECONDS = LEAD_TRACK_SECONDS + 0.219
+
+
+def _anchor_report(logger: MagicMock) -> tuple[float, int, int, int]:
+    """Return the drift, anchor, produced end and declared end of the last report."""
+    for call in logger.debug.call_args_list:
+        if call.args and call.args[0] == (
+            "PROGRAM-BUS anchor drift=%.0fms label=%s anchor=%d produced_end=%d declared_end=%d"
+        ):
+            return (
+                cast("float", call.args[1]),
+                cast("int", call.args[3]),
+                cast("int", call.args[4]),
+                cast("int", call.args[5]),
+            )
+    raise AssertionError("the lead did not report its anchor")
+
+
+async def test_the_head_ends_where_the_item_really_ends(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An item that delivers more audio than its declared duration still ends the head on it."""
+    audio, queue, track = _drift_flow(monkeypatch)
+    logger = MagicMock()
+    audio.logger = logger
+
+    output = await _drain(_flow(audio, queue, track))
+
+    frame_size = SAMPLE_SIZE // SECOND
+    real_end = int(DRIFT_REAL_SECONDS * SECOND)
+    voice = int(LEAD * SECOND)
+    drift, anchor, produced_end, declared_end = _anchor_report(logger)
+    # the anchor follows the audio the item really produced, not duration - seek
+    assert produced_end == real_end
+    assert anchor == real_end - voice
+    assert declared_end == LEAD_TRACK_SECONDS * SECOND
+    # the declared durations put the head 219 ms early, which is what the fix moved out
+    assert anchor - (declared_end - voice) == real_end - declared_end
+    # everything before the head is untouched, the head is heard up to the item's end
+    before = anchor * frame_size
+    assert output[:before] == bytes([0x10]) * before
+    mixed_tail = output[before : real_end * frame_size]
+    assert mixed_tail != bytes([0x10]) * len(mixed_tail)
+    assert output[(real_end - 1) * frame_size : real_end * frame_size] != bytes([0x10]) * frame_size
+    # and what is left of that drift is inaudible
+    assert abs(drift) < 50
+
+
+async def test_a_lead_whose_source_still_streams_is_held_the_same_way(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A source that keeps trickling is held back like any other: the head ends on its end."""
+    audio, queue, track = _drift_flow(monkeypatch)
+    # holding a still-streaming tail is what the player's buffer is there for
+    cast("Any", track.streamdetails.buffer).eof = False
+    logger = MagicMock()
+    audio.logger = logger
+
+    output = await _drain(_flow(audio, queue, track))
+
+    frame_size = SAMPLE_SIZE // SECOND
+    real_end = int(DRIFT_REAL_SECONDS * SECOND)
+    voice = int(LEAD * SECOND)
+    drift, anchor, produced_end, declared_end = _anchor_report(logger)
+    assert (anchor, produced_end, declared_end) == (
+        real_end - voice,
+        real_end,
+        LEAD_TRACK_SECONDS * SECOND,
+    )
+    assert abs(drift) < 50
+    before = anchor * frame_size
+    assert output[:before] == bytes([0x10]) * before
+
+
+def test_a_lead_that_lost_its_window_reports_the_drift_it_kept() -> None:
+    """A head that lost its window can not be held, so the report measures what is left."""
+    logger = MagicMock()
+    bus = _bus()
+    bus.feed(_music(1.0))
+    lead = _ProgramLead(
+        bus,
+        logger,
+        _voice(1.0),
+        label="lead:clip",
+        declared_anchor=SECOND,
+    )
+    # the item is already at the frame the declared durations put the head's end on
+    assert lead.arm() == SECOND
+
+    for _ in range(3):
+        released = lead.feed(_music(1.0))
+        assert released == _music(1.0)
+        bus.feed(released)
+    tail = lead.finish()
+
+    # nothing was held back: the item's own audio went through as it came
+    assert tail == ()
+    drift, anchor, produced_end, declared_end = _anchor_report(logger)
+    assert anchor == SECOND
+    assert (produced_end, declared_end) == (4 * SECOND, 2 * SECOND)
+    # the head's end sits 2 s before the item's end, and the report says exactly that
+    assert drift == pytest.approx(-2000, abs=1)
+
+
+def _drift_flow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[StreamsAudio, SimpleNamespace, SimpleNamespace]:
+    """Build a flow whose item delivers 219 ms more audio than its declared duration."""
+    track = _queue_item("item-1", "Track", duration=LEAD_TRACK_SECONDS)
+    clip = _lead_clip()
+    audio, queue, _mass = _flow_audio(
+        monkeypatch, next_item=clip, load_next=[clip, QueueEmpty], program_bus=True
+    )
+    del audio.crossfade_allowed
+
+    async def _item_stream(
+        queue_item: SimpleNamespace, *_args: object, **_kwargs: object
+    ) -> AsyncGenerator[bytes]:
+        # a seeked source delivers a little more than the whole-second metadata duration
+        marker = 0x10 if queue_item.queue_item_id == "item-1" else 0x40
+        remaining = (
+            DRIFT_REAL_SECONDS
+            if queue_item.queue_item_id == "item-1"
+            else queue_item.streamdetails.duration
+        )
+        while remaining > 0:
+            yield bytes([marker]) * int(min(1.0, remaining) * SAMPLE_SIZE)
+            remaining -= 1.0
+
+    monkeypatch.setattr(audio, "get_queue_item_stream", _item_stream)
+    return audio, queue, track
+
+
+async def test_a_cancelled_lead_is_not_placed_behind_the_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A skip drops the head even after its tail was already held back on the bus."""
+    audio, queue, mass, _opened, track = _lead_flow(monkeypatch, program_bus=True)
+    published: list[_FlowProgramBus] = []
+    mass.streams.register_program_bus.side_effect = lambda _queue_id, bus: published.append(bus)
+    logger = MagicMock()
+    audio.logger = logger
+
+    output = bytearray()
+    cancelled = False
+    async for chunk in _flow(audio, queue, track):
+        output.extend(chunk)
+        if published and not cancelled:
+            published[0].cancel_all("next")
+            cancelled = True
+        await asyncio.sleep(0)
+
+    # the track plays untouched: its tail never got the head
+    track_bytes = int(LEAD_TRACK_SECONDS * SAMPLE_SIZE)
+    assert output[:track_bytes] == bytes([0x10]) * track_bytes
+    assert any(
+        call.args and call.args[0] == "PROGRAM-BUS anchor label=%s dropped: cancelled"
+        for call in logger.debug.call_args_list
+    )
+
+
+async def test_a_group_flow_stream_mixes_its_program_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A flow stream of a two-member group runs one bus, so both members share one mix."""
+    track = _queue_item("item-1", "Track", duration=4)
+    audio, queue, mass = _flow_audio(
+        monkeypatch,
+        next_item=None,
+        load_next=[QueueEmpty],
+        crossfade_mode=CrossfadeMode.DISABLED,
+        program_bus=True,
+    )
+    del audio.crossfade_allowed
+    _install_lead_item_streams(monkeypatch, audio)
+    player = cast("Any", mass.players.get_player.return_value)
+    player.state.group_members = ["member-a", "member-b"]
+    published: list[_FlowProgramBus] = []
+    mass.streams.register_program_bus.side_effect = lambda _queue_id, bus: published.append(bus)
+
+    output = bytearray()
+    anchor = 0
+    async for chunk in _flow(audio, queue, track):
+        if published and not output:
+            anchor = published[0].produced_frames
+            assert published[0].schedule(_voice(1.0), anchor, label="announcement") is not None
+        output.extend(chunk)
+        await asyncio.sleep(0)
+
+    # the group's session runs a single bus ...
+    assert len(published) == 1
+    # ... and its mix carries the program exactly once, over the frame it was placed at
+    frame_size = SAMPLE_SIZE // SECOND
+    marker = bytes([0x10]) * frame_size
+    changed = [
+        index
+        for index in range(len(output) // frame_size)
+        if output[index * frame_size : (index + 1) * frame_size] != marker
+    ]
+    assert changed[0] == anchor
+    assert changed[-1] == anchor + SECOND + int(VOICE_OVER_RAMP * SECOND) - 1
+    # no second copy of the program elsewhere (a frame or two can round onto the
+    # untouched level inside the ramp)
+    assert len(changed) >= changed[-1] - changed[0] + 1 - 2
+
+
+FLOW_MATCH_INFO = {
+    "session_id": "session-1",
+    "queue_id": "queue-1",
+    "queue_item_id": "item-1",
+    "player_id": "player-1",
+    "fmt": "pcm",
+}
+
+
+def _flow_start_item() -> QueueItem:
+    """Return a track item with resolved stream details."""
+    item = QueueItem(queue_id="queue-1", queue_item_id="item-1", name="Track", duration=180)
+    item.streamdetails = StreamDetails(
+        provider="local--1",
+        item_id="item-1",
+        audio_format=AudioFormat(
+            content_type=ContentType.FLAC, sample_rate=44100, bit_depth=16, channels=2
+        ),
+        media_type=MediaType.TRACK,
+        stream_type=StreamType.LOCAL_FILE,
+        path="/music/item1.flac",
+        duration=180,
+    )
+    item.streamdetails.volume_normalization_mode = VolumeNormalizationMode.DISABLED
+    return item
+
+
+def _flow_request_controller(*, program_bus: bool) -> MagicMock:
+    """
+    Return a streams controller answering the flow stream request of one track.
+
+    :param program_bus: Whether the experimental program bus is switched on.
+    """
+    controller = MagicMock()
+    controller.get_crossfade_mode.return_value = CrossfadeMode.DISABLED
+    controller.flow_mode_required.return_value = False
+    controller.boundary_mix_required.return_value = False
+    controller.program_bus_enabled.return_value = program_bus
+    controller._get_flow_start_item.return_value = _flow_start_item()
+    queue = controller.mass.player_queues.get.return_value
+    queue.overlay_enabled = False
+    queue.overlay_source = None
+    controller.mass.player_queues.queue_data.return_value = SimpleNamespace(session_id="session-1")
+    controller.mass.player_queues.flow_stream_finished.return_value = False
+    controller.mass.players.get_player.return_value = _make_player(
+        supported=[(44100, 16)], flow_mode=FLOW_MODE_SAMPLE_RATE_SMART
+    )
+    controller.mass.players.get_player.return_value.get_config_value = MagicMock(return_value=False)
+    controller.mass.config.get_raw_player_config_value.return_value = "disabled"
+    controller.audio = _make_streams_audio()
+    controller.audio.select_flow_pcm_format = AsyncMock(
+        wraps=controller.audio.select_flow_pcm_format
+    )
+    controller.audio.get_output_format = AsyncMock(return_value=TEST_PCM_FORMAT)
+    return controller
+
+
+@pytest.mark.parametrize(
+    ("program_bus", "bit_depth"),
+    [(True, 32), (False, 16)],
+    ids=["bus-on", "bus-off"],
+)
+async def test_the_flow_runs_in_float_while_the_program_bus_can_mix(
+    program_bus: bool, bit_depth: int
+) -> None:
+    """A session that may mix a program asks the flow for float PCM, so its sum has room."""
+    controller = _flow_request_controller(program_bus=program_bus)
+    request = make_mocked_request("HEAD", "/flow/item.pcm", match_info=FLOW_MATCH_INFO)
+
+    response = await StreamsController.serve_queue_flow_stream(controller, request)
+
+    assert isinstance(response, web.StreamResponse)
+    format_request = controller.audio.select_flow_pcm_format.await_args
+    assert format_request is not None
+    # the overlay path decides for the whole session: a depth change would restart it
+    assert format_request.kwargs["overlay_active"] is program_bus
+    # the flow then really runs in float (or keeps the source's 16-bit without the bus)
+    output_request = controller.audio.get_output_format.await_args
+    assert output_request is not None
+    assert output_request.kwargs["content_bit_depth"] == bit_depth

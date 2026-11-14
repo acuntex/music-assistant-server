@@ -8,7 +8,10 @@ from unittest.mock import MagicMock
 
 from music_assistant.controllers.streams import StreamsController
 from music_assistant.controllers.streams.audio import _FlowProgramBus
-from music_assistant.controllers.streams.constants import VOICE_OVER_RAMP
+from music_assistant.controllers.streams.constants import (
+    CONF_STREAM_PROGRAM_BUS,
+    VOICE_OVER_RAMP,
+)
 from music_assistant.controllers.streams.smart_fades.filters import VOICE_OVER_DUCK_DEPTH
 from tests.controllers.streams.test_crossfade_transition import TEST_PCM_FORMAT
 
@@ -109,8 +112,9 @@ def test_a_thirty_second_item_keeps_its_length_and_is_ducked_in_the_overlay_wind
     ducked = int(MUSIC_LEVEL * (1 - VOICE_OVER_DUCK_DEPTH)) + VOICE_LEVEL
     # untouched right up to the anchor
     assert levels[int((OVERLAY_START - 0.01) * SECOND)] == MUSIC_LEVEL
-    # ducked with the voice summed in, for the whole overlay
-    assert levels[int((OVERLAY_START + 0.01) * SECOND)] == ducked
+    # the music is pulled down over the duck-in ramp, then held under the voice
+    assert levels[int((OVERLAY_START + 0.01) * SECOND)] > ducked
+    assert levels[int((OVERLAY_START + VOICE_OVER_RAMP + 0.01) * SECOND)] == ducked
     assert levels[int((OVERLAY_START + OVERLAY_SECONDS - 0.01) * SECOND)] == ducked
     # the ramp back is over well before the item ends
     back = int((OVERLAY_START + OVERLAY_SECONDS + VOICE_OVER_RAMP + 0.01) * SECOND)
@@ -163,6 +167,16 @@ def test_no_flow_stream_reports_no_pcm_format() -> None:
     controller = _controller()
 
     assert controller.program_bus_format("queue-1") is None
+
+
+def test_the_program_bus_switch_is_the_streams_config_setting() -> None:
+    """Whether sessions may mix programs is the experimental streams setting."""
+    controller = _controller()
+    controller.config = MagicMock()
+    controller.config.get_value.return_value = True
+
+    assert controller.program_bus_enabled() is True
+    controller.config.get_value.assert_called_once_with(CONF_STREAM_PROGRAM_BUS, False)
 
 
 def test_the_program_bus_claim_holds_while_any_owner_requires_it() -> None:

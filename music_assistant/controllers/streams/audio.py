@@ -128,7 +128,10 @@ from music_assistant.controllers.streams.constants import (
 from music_assistant.controllers.streams.ogg_handler import get_chained_ogg_stream
 from music_assistant.controllers.streams.smart_fades import SmartFadesMixer
 from music_assistant.controllers.streams.smart_fades.fades import SmartFade, StandardCrossFade
-from music_assistant.controllers.streams.smart_fades.filters import VOICE_OVER_DUCK_DEPTH
+from music_assistant.controllers.streams.smart_fades.filters import (
+    MIX_CEILING_DB,
+    VOICE_OVER_DUCK_DEPTH,
+)
 from music_assistant.controllers.streams.smart_fades.helpers import SMART_CROSSFADE_DURATION
 from music_assistant.controllers.streams.stream_sources import (
     QualityTier,
@@ -399,6 +402,9 @@ class _ProgramOverlay:
         ramp = max(1, int(VOICE_OVER_RAMP * self._sample_rate))
         self.duck_head = ramp
         self.duck_tail = ramp
+        # the mix is capped at the ceiling the boundary's voice-over limiter holds, so a
+        # full-scale voice summed over full-scale music saturates instead of wrapping
+        self.ceiling = 10 ** (MIX_CEILING_DB / 20)
         self._stop_frame = stop_frame
         self._voice_end = self.start_frame + self.voice_frames
         self.end_frame = self._end_of(self._voice_end + self.duck_tail)
@@ -465,7 +471,8 @@ class _ProgramOverlay:
         depth = VOICE_OVER_DUCK_DEPTH
         offset = (position - self.start_frame) * self._frame_size
         if position < self._voice_end:
-            ducked = depth
+            # the boundary's voice-over pulls the music down over the ramp, then holds it
+            ducked = depth * min(1.0, (position - self.start_frame + 1) / self.duck_head)
         else:
             ducked = depth * max(0.0, (self.end_frame - position) / self.duck_tail)
             offset = -1
@@ -475,13 +482,15 @@ class _ProgramOverlay:
             spoken = self._unpack(self.voice_pcm[offset : offset + self._frame_size])
             if self._codec == "f32":
                 for index, value in enumerate(samples):
-                    samples[index] = max(-1.0, min(1.0, value * gain + spoken[index]))
+                    samples[index] = max(
+                        -self.ceiling, min(self.ceiling, value * gain + spoken[index])
+                    )
             else:
                 for index, value in enumerate(samples):
                     samples[index] = max(-32768, min(32767, int(value * gain) + spoken[index]))
         elif self._codec == "f32":
             for index, value in enumerate(samples):
-                samples[index] = max(-1.0, min(1.0, value * gain))
+                samples[index] = max(-self.ceiling, min(self.ceiling, value * gain))
         else:
             for index, value in enumerate(samples):
                 samples[index] = max(-32768, min(32767, int(value * gain)))
@@ -509,6 +518,9 @@ class _FlowProgramBus:
         self._logger = logger
         self._frame_size = (pcm_format.bit_depth // 8) * pcm_format.channels
         self.produced_frames = 0
+        # bumped whenever the session is told to drop its programs, so a program that is
+        # not placed yet can tell that it was cancelled in the meantime
+        self.cancel_generation = 0
         self._overlays: list[_ProgramOverlay] = []
 
     @property
@@ -520,6 +532,11 @@ class _FlowProgramBus:
     def pcm_format(self) -> AudioFormat:
         """Return the PCM format of the flow this bus belongs to."""
         return self._pcm_format
+
+    @property
+    def frame_size(self) -> int:
+        """Return the size in bytes of one frame of the flow's PCM format."""
+        return self._frame_size
 
     def schedule(
         self,
@@ -608,10 +625,24 @@ class _FlowProgramBus:
 
         :param reason: Why they are dropped, for the log.
         """
+        self.cancel_generation += 1
         if not self._overlays:
             return
         self._overlays.clear()
         self._logger.debug("PROGRAM-BUS cancel reason=%s", reason)
+
+    def cancel(self, label: str, reason: str) -> None:
+        """
+        Drop the program with the given label, if it is still to be heard.
+
+        :param label: Label the program was scheduled with.
+        :param reason: Why it is dropped, for the log.
+        """
+        dropped = [overlay for overlay in self._overlays if overlay.label == label]
+        if not dropped:
+            return
+        self._overlays = [overlay for overlay in self._overlays if overlay.label != label]
+        self._logger.debug("PROGRAM-BUS cancel reason=%s label=%s", reason, label)
 
     def drop_unreached(self, label_prefix: str, reason: str) -> None:
         """
@@ -634,21 +665,194 @@ class _FlowProgramBus:
         )
 
 
+class _ProgramLead:
+    """
+    A clip's head, mixed over the running item's tail so that it ends where the item ends.
+
+    The head has to end exactly on the item's last frame: the clip's own stream continues
+    from there, so an anchor short of the item's end leaves a hole in its speech. A track's
+    duration is a whole-second media estimate and a seek lands a few hundred ms away from
+    it, so the anchor is not derived from declared durations. Instead the item's last
+    `lead` is held back from the bus and the head is placed on that tail once the item's
+    stream ends: its end then falls on the frame the item really ended on.
+    """
+
+    def __init__(
+        self,
+        program_bus: _FlowProgramBus,
+        logger: logging.Logger,
+        voice_pcm: bytes,
+        *,
+        label: str,
+        declared_anchor: int,
+    ) -> None:
+        """
+        Prepare the head and its tail hold.
+
+        :param program_bus: The session's program bus.
+        :param logger: Logger of the audio sub-controller, for the drift report.
+        :param voice_pcm: The clip's head, in the flow's PCM format.
+        :param label: Name of the program, for the log.
+        :param declared_anchor: Frame the declared durations put the head at.
+        """
+        self._bus = program_bus
+        self._logger = logger
+        self._pcm = voice_pcm
+        self.label = label
+        self._declared_anchor = declared_anchor
+        self._frame_size = max(program_bus.frame_size, 1)
+        self._sample_rate = max(program_bus.pcm_format.sample_rate, 1)
+        self.voice_frames = len(voice_pcm) // self._frame_size
+        # the head is held back from the bus in whole frames, exactly as long as it is
+        self._hold_bytes = self.voice_frames * self._frame_size
+        self._tail: deque[bytes] = deque()
+        self._tail_bytes = 0
+        self._holding = False
+        self._anchor: int | None = None
+        self._cancel_generation = program_bus.cancel_generation
+
+    def arm(self) -> int | None:
+        """
+        Place the head where the declared durations expect the item to end.
+
+        :return: The frame it was anchored at, or None when it can not be mixed.
+        """
+        self._anchor = self._bus.schedule(
+            self._pcm,
+            self._declared_anchor,
+            label=self.label,
+            stop_frame=self._declared_anchor + self.voice_frames,
+        )
+        return self._anchor
+
+    def feed(self, chunk: bytes) -> bytes:
+        """
+        Take one chunk of the item and return the part of it that may be mixed now.
+
+        The item's last frames are kept back (see the class docstring), everything before
+        them goes through the bus at once, so the item's own audio is not delayed.
+
+        :param chunk: One chunk of the item's audio, in the flow's PCM format.
+        """
+        if not chunk:
+            return b""
+        if not self._holding:
+            if not self._may_hold():
+                return chunk
+            self._holding = True
+            # the declared anchor was a guess: the item's produced end replaces it
+            self._bus.cancel(self.label, "tail held back for the item's real end")
+            self._logger.debug(
+                "PROGRAM-BUS lead label=%s holding its last %.2fs back for its real end",
+                self.label,
+                self._hold_bytes / self._frame_size / self._sample_rate,
+            )
+        self._tail.append(chunk)
+        self._tail_bytes += len(chunk)
+        released = bytearray()
+        while self._tail_bytes - len(self._tail[0]) >= self._hold_bytes:
+            head = self._tail.popleft()
+            self._tail_bytes -= len(head)
+            released += head
+        return bytes(released)
+
+    def finish(self) -> tuple[bytes, ...]:
+        """
+        Place the head on the frame the item really ended on.
+
+        :return: The held tail, still to be mixed through the bus.
+        """
+        tail, held_bytes = tuple(self._tail), self._tail_bytes
+        self._tail.clear()
+        self._tail_bytes = 0
+        if self._hold_was_cancelled():
+            # the queue moved on and its programs were dropped: this head goes with them
+            self._holding = False
+            self._logger.debug("PROGRAM-BUS anchor label=%s dropped: cancelled", self.label)
+            return tail
+        if self._holding:
+            self._holding = False
+            end_frame = self._bus.produced_frames + held_bytes // self._frame_size
+            self._anchor = self._bus.schedule(
+                self._pcm,
+                end_frame - self.voice_frames,
+                label=self.label,
+                stop_frame=end_frame,
+            )
+        else:
+            # nothing was held: the item's declared end is all the head was placed on
+            end_frame = self._bus.produced_frames
+        self._log_drift(end_frame)
+        return tail
+
+    # --- Private methods ---
+
+    def _hold_was_cancelled(self) -> bool:
+        """Return whether the session dropped its programs after this head was armed."""
+        return self._holding and self._bus.cancel_generation != self._cancel_generation
+
+    def _may_hold(self) -> bool:
+        """Return whether holding the tail back can still put the head on the item's end."""
+        return self._hold_bytes > 0 and self._bus.produced_frames < self._declared_anchor
+
+    def _log_drift(self, end_frame: int) -> None:
+        """
+        Report how far the head's anchor is from the item's produced end.
+
+        :param end_frame: Frame the item's audio really ended on.
+        """
+        if self._anchor is None:
+            return
+        drift_ms = (self._anchor - (end_frame - self.voice_frames)) / self._sample_rate * 1000
+        self._logger.debug(
+            "PROGRAM-BUS anchor drift=%.0fms label=%s anchor=%d produced_end=%d declared_end=%d",
+            drift_ms,
+            self.label,
+            self._anchor,
+            end_frame,
+            self._declared_anchor + self.voice_frames,
+        )
+
+
 async def _through_program_bus(
-    music: AsyncGenerator[bytes], program_bus: _FlowProgramBus
+    music: AsyncGenerator[bytes],
+    program_bus: _FlowProgramBus,
+    lead: _ProgramLead | None = None,
 ) -> AsyncGenerator[bytes]:
     """
     Run an item's audio through the session's program bus.
 
     :param music: The item's own stream.
     :param program_bus: The session's program bus.
+    :param lead: The clip's head to place on this item's end, if one was armed for it.
     """
     try:
         async for chunk in music:
-            yield program_bus.feed(chunk)
+            if lead is None:
+                yield program_bus.feed(chunk)
+                continue
+            released = lead.feed(chunk)
+            if released:
+                yield program_bus.feed(released)
+        if lead is not None:
+            # the item's end is known now: the head is placed on it and the tail it was
+            # held back for is mixed through the bus with the head on top of it
+            for held in lead.finish():
+                yield program_bus.feed(held)
     finally:
         # closing this wrapper has to release the decoder underneath it as well
         await music.aclose()
+
+
+def source_fully_buffered(queue_item: QueueItem) -> bool:
+    """
+    Return whether the item's source delivered all of its audio.
+
+    :param queue_item: The item being streamed.
+    """
+    streamdetails = queue_item.streamdetails
+    audio_buffer = cast("AudioBuffer | None", streamdetails.buffer) if streamdetails else None
+    return audio_buffer is not None and audio_buffer.eof and not audio_buffer.has_error
 
 
 def tail_hold_target(queue_item: QueueItem, max_bytes: int, frame_size: int) -> int:
@@ -662,13 +866,7 @@ def tail_hold_target(queue_item: QueueItem, max_bytes: int, frame_size: int) -> 
     :param max_bytes: The full fade-out window (the cap).
     :param frame_size: PCM frame size the target is aligned down to.
     """
-    streamdetails = queue_item.streamdetails
-    audio_buffer = cast("AudioBuffer | None", streamdetails.buffer) if streamdetails else None
-    if audio_buffer is None or not audio_buffer.eof:
-        return 0
-    if audio_buffer.has_error:
-        # a failed source is skipped without a fade, so its remaining audio is
-        # better off played out than held back for one
+    if not source_fully_buffered(queue_item):
         return 0
     return max_bytes // frame_size * frame_size
 
@@ -3378,10 +3576,11 @@ class StreamsAudio:
                         session_id=flow_session_id,
                         prepared_buffer=incoming_audio_buffer,
                     )
-                # a clip may start over this item's tail: place its head on the session's
-                # program bus, anchored at the frame this item ends on
+                # a clip may start over this item's tail: arm its head on the session's
+                # program bus, to be placed where this item really ends
+                lead: _ProgramLead | None = None
                 if program_bus is not None:
-                    await self._schedule_program_lead(
+                    lead = await self._schedule_program_lead(
                         program_bus,
                         queue.queue_id,
                         queue_track,
@@ -3390,7 +3589,7 @@ class StreamsAudio:
                         track_playback_speed,
                         incoming_prefetcher,
                     )
-                    item_stream = _through_program_bus(item_stream, program_bus)
+                    item_stream = _through_program_bus(item_stream, program_bus, lead)
 
                 # closing here releases the decoders on an early exit,
                 # instead of leaving them to the garbage collector
@@ -3628,12 +3827,10 @@ class StreamsAudio:
                     )
                     return
 
-                if program_bus is not None:
+                if program_bus is not None and lead is not None:
                     # a lead this item never reached would otherwise play over the item
                     # after it, where it does not belong
-                    program_bus.drop_unreached(
-                        f"lead:{queue_track.queue_item_id}", "item ended before its anchor"
-                    )
+                    program_bus.drop_unreached(lead.label, "item ended before its anchor")
 
                 # A source error after partial audio must not look like a completed item.
                 # Progress reporting skips items with stream_error, so the item is not
@@ -5539,9 +5736,9 @@ class StreamsAudio:
         seek_position: float,
         playback_speed: float,
         incoming_prefetcher: _IncomingFadePrefetcher,
-    ) -> int | None:
+    ) -> _ProgramLead | None:
         """
-        Place the next clip's head on the program bus at the frame this item ends on.
+        Arm the next clip's head on the program bus at the frame this item ends on.
 
         The head is taken out of the stream the clip continues on, so the clip is decoded
         once: the bus plays it over this item's tail and the clip's own stream carries on
@@ -5618,13 +5815,17 @@ class StreamsAudio:
             len(voice_pcm),
             anchor,
         )
-        # the voice has to end where this item ends, so its duck ramp stays inside it
-        return program_bus.schedule(
+        # the anchor the declared durations give is only a starting point: the head is
+        # moved onto the item's produced end when its tail is released (see _ProgramLead)
+        lead = _ProgramLead(
+            program_bus,
+            self.logger,
             voice_pcm,
-            anchor,
             label=f"lead:{next_item.queue_item_id}",
-            stop_frame=item_end_frame,
+            declared_anchor=anchor,
         )
+        lead.arm()
+        return lead
 
     @staticmethod
     def _planned_lead(queue_item: QueueItem | None, outgoing_item_id: str) -> float | None:

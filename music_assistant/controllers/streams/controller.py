@@ -610,6 +610,10 @@ class StreamsController(CoreController):
         """
         return queue_id in self._program_bus_owners
 
+    def program_bus_enabled(self) -> bool:
+        """Return whether the streams program bus is switched on (it is experimental)."""
+        return self.get_config_value(CONF_STREAM_PROGRAM_BUS, False, return_type=bool)
+
     def register_program_bus(self, queue_id: str, program_bus: _FlowProgramBus) -> None:
         """
         Publish the program bus of a flow session that just started for the queue.
@@ -743,9 +747,11 @@ class StreamsController(CoreController):
                 key=CONF_STREAM_PROGRAM_BUS,
                 type=ConfigEntryType.BOOLEAN,
                 default_value=False,
-                label="Experimentell: Ansagen mitten im Track (Program-Bus)",
-                description="Mischt Ansagen in den laufenden Stream, statt die Wiedergabe "
-                "zu unterbrechen",
+                label="Experimental: announcements in the middle of a track (program bus)",
+                description="Mixes announcements into the running stream instead of interrupting "
+                "playback. A lead a provider plans (`allow_pre`) only takes effect while this "
+                "is on, because a realtime source cannot hold its tail back for the clip to "
+                "start over: without it the clip begins at the boundary.",
                 category="playback",
                 advanced=True,
             ),
@@ -1672,6 +1678,10 @@ class StreamsController(CoreController):
             else CrossfadeMode.DISABLED
         )
         mix_overlay = overlay_mixed_in(queue, start_queue_item, flow_mode=True)
+        # a session that may mix programs sums a voice over the music, which only holds up
+        # in float: the choice is made for the whole session, as a depth change would
+        # restart the stream (it applies from the next play start)
+        mix_programs = self.program_bus_enabled()
         flow_pcm_format = await self.audio.select_flow_pcm_format(
             player,
             start_streamdetails=start_queue_item.streamdetails,
@@ -1684,7 +1694,7 @@ class StreamsController(CoreController):
                 start_queue_item.streamdetails is not None
                 and start_queue_item.streamdetails.tail_overlap is not None
             ),
-            overlay_active=mix_overlay,
+            overlay_active=mix_overlay or mix_programs,
         )
 
         # work out output format/details

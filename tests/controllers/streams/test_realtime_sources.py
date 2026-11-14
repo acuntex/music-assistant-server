@@ -2180,6 +2180,8 @@ def _single_item_handler(
     audio.select_pcm_format = _select_pcm_format
     audio.fade_into_pending = MagicMock(return_value=False)
     controller = cast("Any", object.__new__(StreamsController))
+    controller.config = MagicMock()
+    controller.config.get_value.return_value = False
     controller.mass = mass
     controller.audio = audio
     controller._open_item_streams = {}
@@ -2367,6 +2369,8 @@ def _flow_handler(
     audio.get_player_output_plan = MagicMock(return_value=SimpleNamespace(filter_params=[]))
 
     controller = cast("Any", object.__new__(StreamsController))
+    controller.config = MagicMock()
+    controller.config.get_value.return_value = False
     controller.mass = mass
     controller.audio = audio
     controller.logger = MagicMock()

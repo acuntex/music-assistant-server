@@ -278,12 +278,23 @@ with, so the flow is neither restarted nor reopened and no second ffmpeg input i
   `play_index`; `stop` and `pause` leave the clip alone, and a session that ends drops its own
   programs. Nothing is made up for later: the rest of the item plays without the duck.
 - An item's declared lead (the `ai_radio_pre_overlap` queue item attributes) is placed on the same
-  bus, anchored at the item's end.
+  bus, anchored at the item's end. Declared durations are whole-second media estimates and a seek
+  lands a few hundred ms away from them, so the head is not anchored on `duration - seek`: the
+  item's last `lead` is held back from the bus and the head is placed on that tail when the item's
+  stream ends, which puts its end on the frame the item really ended on. The hold is bounded by the
+  lead the provider planned (the player's buffer covers it, the same way it covers the tail the flow
+  holds for a boundary); a head that lost its window can not be held and keeps the anchor it was
+  armed with. Each lead logs `PROGRAM-BUS anchor drift=…ms` with the frame it was placed on, the
+  item's produced end and the end the declared durations gave.
+- A session that has the bus switched on selects float PCM for the flow (`overlay_active` in
+  `select_flow_pcm_format`, i.e. the same path the queue overlay uses): summing a voice over music
+  needs the headroom. The choice is made at play start, like every other flow format decision.
 - A plugin that wants its clips over the queue's stream claims it for the queues it is active on
   with `set_program_bus_required(queue_id, owner, required)`, on top of the setting; the claim
   alone enables nothing.
 - `PROGRAM-BUS` debug lines: the session opening, each `schedule` with its `label` and `anchor`,
-  a program that starts `late`, `drained`, and `cancel` with its `reason`.
+  a program that starts `late`, `drained`, `cancel` with its `reason`, and the anchor drift of a
+  lead.
 
 `PlayerController.play_announcement(..., mode="overlay")` renders the clip completely, converts it
 to the session's PCM format and places it on the bus, so the player keeps playing and the

@@ -407,7 +407,10 @@ def test_a_program_overlay_ducks_the_music_and_sums_the_voice() -> None:
 
     assert len(mixed) == len(music)
     samples = struct.unpack(f"<{len(mixed) // 2}h", mixed)
-    # the voice is summed under the ducked music, so the bulk sits well below full level
-    assert max(samples[: len(samples) // 2]) < 60
+    # past the duck-in ramp the music sits at the ducked level under the voice
+    ducked = samples[int(VOICE_OVER_RAMP * frames) * 2 : len(samples) // 2]
+    assert max(ducked) < 60
     # and it is louder than the ducked music alone once the voice plays
-    assert max(samples[: len(samples) // 2]) > 20
+    assert max(ducked) > 20
+    # the music is pulled down over the ramp instead of dropping at once
+    assert samples[0] > ducked[0]
