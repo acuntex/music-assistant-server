@@ -206,6 +206,9 @@ VOICE_OVER_RAMP: Final[float] = 0.4
 # plan one publish it on the clip queue item, but the tail of the track before it has to be
 # held back before that plan exists, so the hold is armed for this much.
 MAX_LEAD_OVERLAP: Final[float] = 12.0
+# What a track's tail hold is widened to so a planned lead can be mixed; the voice needs its
+# ramp on top of the lead itself.
+LEAD_HOLD_CEILING: Final[float] = MAX_LEAD_OVERLAP + VOICE_OVER_RAMP
 # QueueItem.extra_attributes keys a provider uses to declare that a clip starts over the
 # tail of the item before it: the seconds, and the item id it was planned against.
 PRE_OVERLAP_ATTR: Final[str] = "ai_radio_pre_overlap"

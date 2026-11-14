@@ -12,6 +12,7 @@ import asyncio
 import logging
 import os
 import re
+import struct
 import time
 from collections import OrderedDict, deque
 from collections.abc import AsyncGenerator, Callable, Iterable
@@ -108,7 +109,7 @@ from music_assistant.controllers.streams.constants import (
     DEFAULT_VOLUME_NORMALIZATION_MODE,
     HLS_RADIO_INPUT_BURST,
     ICY_PLACEHOLDER_IMAGE_URLS,
-    MAX_LEAD_OVERLAP,
+    LEAD_HOLD_CEILING,
     MIN_VOICE_OVER_DURATION,
     NO_TRACK_MATCH_EXPIRATION,
     NORMALIZATION_LIMITER_CEILING_DB,
@@ -125,6 +126,7 @@ from music_assistant.controllers.streams.constants import (
 from music_assistant.controllers.streams.ogg_handler import get_chained_ogg_stream
 from music_assistant.controllers.streams.smart_fades import SmartFadesMixer
 from music_assistant.controllers.streams.smart_fades.fades import SmartFade, StandardCrossFade
+from music_assistant.controllers.streams.smart_fades.filters import VOICE_OVER_DUCK_DEPTH
 from music_assistant.controllers.streams.smart_fades.helpers import SMART_CROSSFADE_DURATION
 from music_assistant.controllers.streams.stream_sources import (
     QualityTier,
@@ -352,6 +354,124 @@ def overlay_mixed_in(queue: PlayerQueue, queue_item: QueueItem, *, flow_mode: bo
     return flow_mode or queue_item.media_type == MediaType.RADIO
 
 
+class _LeadOverlay:
+    """
+    Sum the head of the upcoming clip over the tail of the item that is playing.
+
+    The music keeps its exact length; it is ducked under the voice where the voice plays and
+    the voice is added sample-wise. 32-bit float and 16-bit integer PCM are mixed, anything
+    else passes the music through.
+    """
+
+    def __init__(self, voice_pcm: bytes, pcm_format: AudioFormat, start_seconds: float) -> None:
+        """
+        Prepare the overlay.
+
+        :param voice_pcm: The clip's head, decoded to the flow's PCM format.
+        :param pcm_format: PCM format of both streams.
+        :param start_seconds: Seconds into the item at which the voice starts.
+        """
+        self._frame_size = (pcm_format.bit_depth // 8) * pcm_format.channels
+        sample_rate = pcm_format.sample_rate
+        if pcm_format.content_type == ContentType.PCM_F32LE and pcm_format.bit_depth == 32:
+            self._codec: str | None = "f32"
+            self._unpack = struct.Struct(f"<{pcm_format.channels}f").unpack
+            self._pack = struct.Struct(f"<{pcm_format.channels}f").pack
+        elif pcm_format.bit_depth == 16:
+            self._codec = "s16"
+            self._unpack = struct.Struct(f"<{pcm_format.channels}h").unpack
+            self._pack = struct.Struct(f"<{pcm_format.channels}h").pack
+        else:
+            self._codec = None
+        self._voice = voice_pcm
+        self._voice_frames = len(voice_pcm) // self._frame_size if self._frame_size else 0
+        self._start_frame = max(0, int(start_seconds * sample_rate))
+        ramp = max(1, int(VOICE_OVER_RAMP * sample_rate))
+        self._duck_head = ramp
+        self._duck_tail = ramp
+        self._voice_end = self._start_frame + self._voice_frames
+        self._end_frame = self._voice_end + self._duck_tail
+        self._frame_index = 0
+        self._voice_index = 0
+        self._pending = b""
+
+    @property
+    def usable(self) -> bool:
+        """Return whether there is a voice to mix at all."""
+        return self._codec is not None and self._frame_size > 0 and self._voice_frames > 0
+
+    def mix(self, chunk: bytes) -> bytes:
+        """Return the chunk with the voice summed in where it plays."""
+        if not self.usable:
+            return chunk
+        if self._frame_index >= self._end_frame:
+            self._frame_index += len(chunk) // self._frame_size
+            return chunk
+        data = self._pending + chunk
+        whole = len(data) - (len(data) % self._frame_size)
+        self._pending = data[whole:]
+        if not whole:
+            return b""
+        out = bytearray()
+        for offset in range(0, whole, self._frame_size):
+            out += self._mix_frame(data[offset : offset + self._frame_size])
+            self._frame_index += 1
+        return bytes(out)
+
+    def flush(self) -> bytes:
+        """Return the trailing partial frame, if any."""
+        pending, self._pending = self._pending, b""
+        return pending
+
+    def _mix_frame(self, frame: bytes) -> bytes:
+        """Return one frame, ducked and with the voice summed in where it sounds."""
+        position = self._frame_index
+        if position < self._start_frame or position >= self._end_frame:
+            return frame
+        depth = VOICE_OVER_DUCK_DEPTH
+        if position < self._voice_end:
+            ducked = depth
+        else:
+            ducked = depth * max(0.0, (self._end_frame - position) / self._duck_tail)
+        gain = 1.0 - ducked
+        samples = list(self._unpack(frame))
+        offset = self._voice_index * self._frame_size
+        if position < self._voice_end and offset + self._frame_size <= len(self._voice):
+            spoken = self._unpack(self._voice[offset : offset + self._frame_size])
+            self._voice_index += 1
+            if self._codec == "f32":
+                for index, value in enumerate(samples):
+                    samples[index] = max(-1.0, min(1.0, value * gain + spoken[index]))
+            else:
+                for index, value in enumerate(samples):
+                    samples[index] = max(-32768, min(32767, int(value * gain) + spoken[index]))
+        elif self._codec == "f32":
+            for index, value in enumerate(samples):
+                samples[index] = max(-1.0, min(1.0, value * gain))
+        else:
+            for index, value in enumerate(samples):
+                samples[index] = max(-32768, min(32767, int(value * gain)))
+        return self._pack(*samples)
+
+
+async def _overlay_lead(
+    music: AsyncGenerator[bytes], overlay: _LeadOverlay
+) -> AsyncGenerator[bytes]:
+    """
+    Mix the overlay into the item's stream, keeping its length and chunk size intact.
+
+    :param music: The item's own stream.
+    :param overlay: The prepared clip head.
+    """
+    async for chunk in music:
+        mixed = overlay.mix(chunk)
+        if mixed:
+            yield mixed
+    tail = overlay.flush()
+    if tail:
+        yield tail
+
+
 def tail_hold_target(queue_item: QueueItem, max_bytes: int, frame_size: int) -> int:
     """
     Return how many bytes of tail may be held back for a fade right now.
@@ -414,13 +534,17 @@ async def _incoming_overlap_stream(
 
 class _IncomingFadePrefetcher:
     """
-    Collect the incoming track's fade-in while the outgoing track's tail is held back.
+    Collect audio of the item that follows while the outgoing item still plays.
 
     A flow stream emits nothing while it gathers the audio a transition blends in, so the
     player hears that wait as lost lead. Gathering it alongside the held-back tail instead
     of after it keeps audio flowing right up to the transition. The collected audio and the
     still-open stream are handed over together, so the track is decoded exactly once and the
     seam is a plain continuation.
+
+    The same handover serves the head of a clip that starts over the outgoing item's tail:
+    the head is read here once and travels into the mix, while the still-open stream carries
+    the item's own body from where the head ended.
     """
 
     def __init__(
@@ -443,6 +567,7 @@ class _IncomingFadePrefetcher:
         self._chunks: deque[bytes] = deque()
         self._target = 0
         self._failed = False
+        self._head_seconds: float | None = None
         self._collected_at_handover = 0
         self._task: asyncio.Task[None] | None = None
 
@@ -524,6 +649,70 @@ class _IncomingFadePrefetcher:
             queue_item.name,
         )
 
+    async def collect_head(self, queue_item: QueueItem, seconds: float) -> bytes:
+        """
+        Read the head of the next item now and keep its stream open for the item's body.
+
+        The head is taken out of the very stream the item continues on, so the audio is
+        decoded once: the head travels into the mix over the outgoing item, and what is
+        handed over afterwards is exactly what comes after it.
+
+        :param queue_item: The item whose head is wanted.
+        :param seconds: How many seconds of it to take out, in stream time.
+        :return: The head, or empty when nothing could be read.
+        """
+        streamdetails = queue_item.streamdetails
+        target = int(self._pcm_format.pcm_sample_size * seconds)
+        if self._task is not None or streamdetails is None or target <= 0:
+            return b""
+        self._target = target
+        self._queue_item_id = queue_item.queue_item_id
+        self._streamdetails = streamdetails
+        self._seek_position = 0
+        self._chunks = deque()
+        self._head_seconds = seconds
+        self._stream = self._audio.get_queue_item_stream(
+            queue_item,
+            pcm_format=self._pcm_format,
+            seek_position=0,
+            playback_speed=cast("float", queue_item.extra_attributes.get("playback_speed", 1.0)),
+            raise_on_error=False,
+            session_id=self._session_id,
+        )
+        self._task = asyncio.create_task(
+            self._collect(self._stream, self._chunks, what="head of the incoming item")
+        )
+        await asyncio.gather(self._task)
+        if not self._chunks:
+            await self.close()
+            return b""
+        # a head in hand is what the item continues from, so it stays handable even when
+        # the source ended short of it
+        self._failed = False
+        collected = b"".join(self._chunks)
+        self._chunks = deque([collected[target:]] if collected[target:] else [])
+        self._audio.logger.debug(
+            "Collected %.2f seconds of the head of %s, continuing past it",
+            len(collected[:target]) / self._pcm_format.pcm_sample_size,
+            queue_item.name,
+        )
+        return collected[:target]
+
+    def head_mixed(self, queue_item: QueueItem) -> float | None:
+        """
+        Return the seconds of the given item's head already taken for mixing, if any.
+
+        :param queue_item: The item the flow stream is about to play.
+        """
+        if self._task is None or self._head_seconds is None:
+            return None
+        if (
+            self._queue_item_id != queue_item.queue_item_id
+            or self._streamdetails is not queue_item.streamdetails
+        ):
+            return None
+        return self._head_seconds
+
     async def take(self, queue_item: QueueItem, seek_position: int) -> AsyncGenerator[bytes] | None:
         """
         Hand over the prefetched stream for the given queue item.
@@ -594,9 +783,18 @@ class _IncomingFadePrefetcher:
         self._chunks = deque()
         self._target = 0
         self._failed = False
+        self._head_seconds = None
 
-    async def _collect(self, stream: AsyncGenerator[bytes], chunks: deque[bytes]) -> None:
-        """Read the incoming track until the fade-in target is reached."""
+    async def _collect(
+        self, stream: AsyncGenerator[bytes], chunks: deque[bytes], what: str = "fade-in"
+    ) -> None:
+        """
+        Read the incoming track until the target is reached.
+
+        :param stream: The incoming track's stream.
+        :param chunks: Receives what is read.
+        :param what: What is being read, for the failure log.
+        """
         collected = 0
         try:
             async for chunk in stream:
@@ -611,7 +809,7 @@ class _IncomingFadePrefetcher:
         except Exception as err:
             # the flow stream opens the track itself rather than inheriting a dead stream
             self._failed = True
-            self._audio.logger.warning("Failed to prefetch the incoming fade-in: %s", err)
+            self._audio.logger.warning("Failed to prefetch the %s: %s", what, err)
 
     async def _replay(
         self, chunks: deque[bytes], stream: AsyncGenerator[bytes]
@@ -2080,7 +2278,7 @@ class StreamsAudio:
             if self.mass.streams.boundary_mix_required(queue.queue_id):
                 # a break may start over this item's tail: hold enough of it back for that,
                 # but never more than half the track
-                widened = max(crossfade_buffer_duration, MAX_LEAD_OVERLAP + VOICE_OVER_RAMP)
+                widened = max(crossfade_buffer_duration, LEAD_HOLD_CEILING)
                 if streamdetails.duration:
                     widened = min(widened, streamdetails.duration / 2)
                 crossfade_buffer_duration = widened
@@ -2110,8 +2308,10 @@ class StreamsAudio:
             early_next = self.mass.player_queues.get_next_item(
                 queue.queue_id, queue_item.queue_item_id
             )
-            if early_next is not None and (
-                self._planned_lead(early_next, queue_item.queue_item_id) is not None
+            if (
+                early_next is not None
+                and crossfade_buffer_size
+                and self._planned_lead(early_next, queue_item.queue_item_id) is not None
             ):
                 handoff = asyncio.Event()
                 claimed_for = early_next.queue_item_id
@@ -2312,6 +2512,22 @@ class StreamsAudio:
                         lead_seconds=lead_seconds,
                     )
                     crossfade_allowed = transition_mode != CrossfadeMode.DISABLED
+                    if (
+                        crossfade_allowed
+                        and handoff is not None
+                        and self._crossfade_pending.get(queue.queue_id, (None, None))[1]
+                        is not handoff
+                    ):
+                        # the incoming side gave up waiting for this handoff: it plays its own
+                        # head, so mixing it here would play that head twice
+                        self.logger.debug(
+                            "Not mixing into %s on queue %s: it stopped waiting for the boundary",
+                            next_queue_item.queue_item_id if next_queue_item else "the next item",
+                            queue.display_name,
+                        )
+                        crossfade_allowed = False
+                        handoff = None
+                        claimed_for = None
             if not crossfade_allowed:
                 # no crossfade enabled/allowed, just yield the buffer last part
                 bytes_written += len(tail_window)
@@ -2759,7 +2975,7 @@ class StreamsAudio:
                 if tail_overlap is None and self.mass.streams.boundary_mix_required(queue.queue_id):
                     # a break may start over this track's tail, and that plan only exists
                     # later: hold back enough for it, but never more than half the track
-                    widened = max(crossfade_buffer_duration, MAX_LEAD_OVERLAP + VOICE_OVER_RAMP)
+                    widened = max(crossfade_buffer_duration, LEAD_HOLD_CEILING)
                     if queue_track.streamdetails.duration:
                         widened = min(widened, queue_track.streamdetails.duration / 2)
                     crossfade_buffer_duration = widened
@@ -2804,7 +3020,31 @@ class StreamsAudio:
                             else "",
                         )
                     ) is not None:
-                        requested_mode = CrossfadeMode.VOICE_OVER
+                        if incoming_prefetcher.head_mixed(queue_track) is not None:
+                            # the clip's head already played over this item's tail, mixed
+                            # into the running flow: blending it in here as well would air
+                            # it twice and leave the body its own stream still owes
+                            self.logger.debug(
+                                "LEAD-OVERLAY boundary clip=%s out=%s head already mixed",
+                                queue_track.queue_item_id,
+                                outgoing_queue_track.queue_item_id
+                                if outgoing_queue_track is not None
+                                else None,
+                            )
+                            requested_mode = CrossfadeMode.DISABLED
+                        else:
+                            requested_mode = CrossfadeMode.VOICE_OVER
+                    # DEBUG-INSTRUMENTATION (ci branch): the boundary side of the handshake
+                    self.logger.debug(
+                        "LEAD-BOUNDARY in=%s(%s) out=%s lead=%r raw=%r from=%r tail_held=%.2fs",
+                        queue_track.queue_item_id,
+                        queue_track.media_type,
+                        outgoing_queue_track.queue_item_id if outgoing_queue_track else None,
+                        lead_seconds,
+                        queue_track.extra_attributes.get(PRE_OVERLAP_ATTR),
+                        queue_track.extra_attributes.get(PRE_OVERLAP_FROM_ATTR),
+                        len(last_fadeout_part) / pcm_sample_size,
+                    )
                     if requested_mode == CrossfadeMode.VOICE_OVER or (
                         crossfade_buffer_size > 0 and requested_mode != CrossfadeMode.DISABLED
                     ):
@@ -2896,6 +3136,20 @@ class StreamsAudio:
                             + (timing_info.fadein_trimmed_duration + timing_info.crossfade_duration)
                             * track_playback_speed
                         )
+                # a clip whose head already played over the previous item's tail continues on
+                # its own stream from past it, and is reported from where it is really heard
+                if (
+                    transition_mode == CrossfadeMode.DISABLED
+                    and (lead_head := incoming_prefetcher.head_mixed(queue_track)) is not None
+                ):
+                    raw_seek_position = 0
+                    queue_track.streamdetails.seek_position = lead_head
+                    self.logger.debug(
+                        "LEAD-OVERLAY body clip=%s(%s) lead=%.2fs",
+                        queue_track.queue_item_id,
+                        queue_track.media_type,
+                        lead_head,
+                    )
                 # no fade is credited to this track until one is really rendered below
                 self._report_crossfade_mode(
                     queue.queue_id,
@@ -2919,9 +3173,7 @@ class StreamsAudio:
                 # from the streamdetails before it releases it, which the duration writeback
                 # must see
                 source_buffer: AudioBuffer | None = None
-                holding_back = item_crossfade_mode != CrossfadeMode.DISABLED or (
-                    self.mass.streams.boundary_mix_required(queue.queue_id)
-                )
+                holding_back = item_crossfade_mode != CrossfadeMode.DISABLED
 
                 item_stream = await incoming_prefetcher.take(queue_track, int(raw_seek_position))
                 prefetched_size = incoming_prefetcher.collected_at_handover if item_stream else 0
@@ -2937,6 +3189,17 @@ class StreamsAudio:
                         session_id=flow_session_id,
                         prepared_buffer=incoming_audio_buffer,
                     )
+                # a clip may start over this item's tail: mix its head in while this one ends
+                lead_overlay = await self._prepare_lead_overlay(
+                    queue.queue_id,
+                    queue_track,
+                    pcm_format,
+                    raw_seek_position,
+                    track_playback_speed,
+                    incoming_prefetcher,
+                )
+                if lead_overlay is not None:
+                    item_stream = _overlay_lead(item_stream, lead_overlay)
 
                 # closing here releases the decoders on an early exit,
                 # instead of leaving them to the garbage collector
@@ -3238,6 +3501,26 @@ class StreamsAudio:
                         else MIN_CROSSFADE_DURATION
                     )
                 )
+                # DEBUG-INSTRUMENTATION (ci branch): what the end-of-item block has to work with
+                self.logger.debug(
+                    "LEAD-HOLD item=%s(%s) mode=%s holding=%s buf_target=%dB held=%dB "
+                    "min=%dB lead_planned=%r next=%s",
+                    queue_track.queue_item_id,
+                    queue_track.media_type,
+                    item_crossfade_mode,
+                    holding_back,
+                    crossfade_buffer_size,
+                    len(crossfade_buffer),
+                    min_fade_out_size,
+                    lead_planned,
+                    self.mass.player_queues.get_next_item(
+                        queue.queue_id, queue_track.queue_item_id
+                    ).queue_item_id
+                    if self.mass.player_queues.get_next_item(
+                        queue.queue_id, queue_track.queue_item_id
+                    )
+                    else None,
+                )
                 if len(crossfade_buffer) >= min_fade_out_size and self.crossfade_allowed(
                     queue_track,
                     crossfade_mode=item_crossfade_mode,
@@ -3378,23 +3661,6 @@ class StreamsAudio:
             for fd in pass_fds:
                 os.close(fd)
 
-    @staticmethod
-    def _planned_lead(queue_item: QueueItem | None, outgoing_item_id: str) -> float | None:
-        """
-        Return the lead a clip declares over the given outgoing item, if any.
-
-        :param queue_item: The incoming queue item, which may declare a lead.
-        :param outgoing_item_id: Queue item the lead was planned against.
-        """
-        if queue_item is None:
-            return None
-        declared = queue_item.extra_attributes.get(PRE_OVERLAP_ATTR)
-        if not isinstance(declared, (int, float)) or declared <= 0:
-            return None
-        if queue_item.extra_attributes.get(PRE_OVERLAP_FROM_ATTR) != outgoing_item_id:
-            return None
-        return float(declared)
-
     def crossfade_allowed(
         self,
         queue_item: QueueItem,
@@ -3434,19 +3700,37 @@ class StreamsAudio:
                 )
                 return False
             return True
+        lead_source = next_queue_item or self.mass.player_queues.get_next_item(
+            queue_item.queue_id, queue_item.queue_item_id
+        )
+        declared_lead = self._planned_lead(lead_source, queue_item.queue_item_id)
+        # DEBUG-INSTRUMENTATION (ci branch): why a lead is or is not applied here
+        self.logger.debug(
+            "LEAD-GATE out=%s(%s) next=%s(%s) raw=%r from=%r accepted=%r",
+            queue_item.queue_item_id,
+            queue_item.media_type,
+            getattr(lead_source, "queue_item_id", None),
+            getattr(lead_source, "media_type", None),
+            lead_source.extra_attributes.get(PRE_OVERLAP_ATTR) if lead_source else None,
+            lead_source.extra_attributes.get(PRE_OVERLAP_FROM_ATTR) if lead_source else None,
+            declared_lead,
+        )
         if (
-            self._planned_lead(
-                next_queue_item
-                or self.mass.player_queues.get_next_item(
-                    queue_item.queue_id, queue_item.queue_item_id
-                ),
+            lead_source is not None
+            and declared_lead is None
+            and lead_source.extra_attributes.get(PRE_OVERLAP_ATTR)
+        ):
+            # a plan exists but names another item than the one playing, so it is stale
+            self.logger.debug(
+                "Ignoring the lead of %s: planned against %s, not %s",
+                lead_source.name,
+                lead_source.extra_attributes.get(PRE_OVERLAP_FROM_ATTR),
                 queue_item.queue_item_id,
             )
-            is not None
-        ):
+        if declared_lead is not None:
             # a declared lead plays this item's tail under the clip that starts: it is kept
-            # when this item's stream holds its tail back, which the smart fade and flow
-            # streams do and the plain item stream does not
+            # whenever this item's stream holds its tail back, which every crossfading
+            # stream does, so the queue's own crossfade setting does not have to allow it
             if queue_item.media_type != MediaType.TRACK:
                 self.logger.debug("Skipping the lead overlap: current item is not a track")
                 return False
@@ -5044,6 +5328,94 @@ class StreamsAudio:
             await handover.close()
             return None
         return handover
+
+    async def _prepare_lead_overlay(
+        self,
+        queue_id: str,
+        queue_track: QueueItem,
+        pcm_format: AudioFormat,
+        seek_position: float,
+        playback_speed: float,
+        incoming_prefetcher: _IncomingFadePrefetcher,
+    ) -> _LeadOverlay | None:
+        """
+        Return the overlay that starts the next clip over this item's tail, if one is planned.
+
+        The clip's head is taken out of the stream it will continue on, so it is decoded once:
+        the overlay plays it here and the clip's own stream carries on from past it.
+
+        :param queue_id: The queue the item plays on.
+        :param queue_track: The item that is playing.
+        :param pcm_format: The flow's PCM format.
+        :param seek_position: Where this item's stream starts, in media seconds.
+        :param playback_speed: Multiplier between stream time and media time.
+        :param incoming_prefetcher: Prefetcher that keeps the clip's head and its open stream.
+        """
+        streamdetails = queue_track.streamdetails
+        if (
+            queue_track.media_type != MediaType.TRACK
+            or streamdetails is None
+            or not streamdetails.duration
+        ):
+            return None
+        next_item = self.mass.player_queues.get_next_item(queue_id, queue_track.queue_item_id)
+        lead_seconds = self._planned_lead(next_item, queue_track.queue_item_id)
+        if lead_seconds is None or next_item is None:
+            return None
+        if next_item.streamdetails is None:
+            # the clip is due only after this item, so its details may not exist yet
+            try:
+                await self.get_stream_details(queue_item=next_item)
+            except MusicAssistantError as err:
+                self.logger.debug(
+                    "Not starting %s over %s: %s", next_item.name, queue_track.name, err
+                )
+                return None
+        remaining_media = streamdetails.duration - seek_position
+        if remaining_media <= 0:
+            return None
+        lead_seconds = min(lead_seconds, remaining_media / max(playback_speed, 1e-6))
+        voice_pcm = await incoming_prefetcher.collect_head(next_item, lead_seconds)
+        if not voice_pcm:
+            self.logger.debug(
+                "Not starting %s over %s: its head could not be read",
+                next_item.name,
+                queue_track.name,
+            )
+            return None
+        start_seconds = max(0.0, (remaining_media - lead_seconds) / max(playback_speed, 1e-6))
+        self.logger.info(
+            "Starting %s over the last %.1fs of %s", next_item.name, lead_seconds, queue_track.name
+        )
+        # DEBUG-INSTRUMENTATION (ci branch): the head that goes into the running flow
+        self.logger.debug(
+            "LEAD-OVERLAY arm out=%s(%s) clip=%s(%s) lead=%.2fs start=%.2fs head=%dB",
+            queue_track.queue_item_id,
+            queue_track.media_type,
+            next_item.queue_item_id,
+            next_item.media_type,
+            lead_seconds,
+            start_seconds,
+            len(voice_pcm),
+        )
+        return _LeadOverlay(voice_pcm, pcm_format, start_seconds)
+
+    @staticmethod
+    def _planned_lead(queue_item: QueueItem | None, outgoing_item_id: str) -> float | None:
+        """
+        Return the lead a clip declares over the given outgoing item, if any.
+
+        :param queue_item: The incoming queue item, which may declare a lead.
+        :param outgoing_item_id: Queue item the lead was planned against.
+        """
+        if queue_item is None:
+            return None
+        declared = queue_item.extra_attributes.get(PRE_OVERLAP_ATTR)
+        if not isinstance(declared, (int, float)) or declared <= 0:
+            return None
+        if queue_item.extra_attributes.get(PRE_OVERLAP_FROM_ATTR) != outgoing_item_id:
+            return None
+        return float(declared)
 
     async def _await_pending_crossfade(
         self, queue: PlayerQueue, queue_item: QueueItem, session_id: str | None

@@ -540,12 +540,13 @@ async def test_a_track_with_a_declared_lead_gets_the_clip_mixed_over_its_tail(
     track.streamdetails.duration = TRACK_SECONDS
     clip = _track("item-2", "Clip")
     clip.media_type = MediaType.SOUND_EFFECT
+    clip.streamdetails.duration = CLIP_SECONDS
     clip.streamdetails.tail_overlap = None
     clip.extra_attributes = {
         "ai_radio_pre_overlap": lead,
         "ai_radio_pre_from": track.queue_item_id,
     }
-    audio, _mass = _item_audio(monkeypatch, next_item=clip, load_next=[clip])
+    audio, _mass = _item_audio(monkeypatch, next_item=clip, load_next=[clip, QueueEmpty])
     _install_item_streams(monkeypatch, audio)
 
     await _drain(_request(audio, track, CrossfadeMode.STANDARD_CROSSFADE))
@@ -555,3 +556,12 @@ async def test_a_track_with_a_declared_lead_gets_the_clip_mixed_over_its_tail(
     assert kwargs["lead"] is True
     # the window is exactly the declared lead, not the queue's crossfade length
     assert kwargs["fade_in_bytes_len"] == int(lead * SAMPLE_SIZE)
+    handover = audio._crossfade_handover["queue-1"]
+    assert handover.queue_item_id == clip.queue_item_id
+    assert handover.elapsed_time_offset == lead
+
+    # the clip continues from the lead, so its head is heard once, under the track's tail
+    clip_output = await _drain(_request(audio, clip, CrossfadeMode.VOICE_OVER))
+
+    assert clip.streamdetails.seek_position == lead
+    assert len(clip_output) == (CLIP_SECONDS - lead) * SAMPLE_SIZE

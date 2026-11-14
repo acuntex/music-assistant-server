@@ -2288,7 +2288,8 @@ def test_the_pre_takes_the_part_of_the_break_the_post_leaves() -> None:
     _attach_queue(renderer, [song, clip])
     _attach_post(renderer, None)
 
-    assert renderer._plan_pre(clip, 8.0, None) == (8.0, song.queue_item_id)
+    # the stream never blends more than half the incoming item, so neither does the plan
+    assert renderer._plan_pre(clip, 8.0, None) == (4.0, song.queue_item_id)
     assert renderer._plan_pre(
         clip,
         8.0,

@@ -167,33 +167,9 @@ class AIRadioRenderMixin:
 
         async with self._lock_for(item_id):
             media = await self._render_clip(queue_item, prompt, item_id)
-            # planned here and never ahead: the plan loads the next track's stream details,
-            # which must not happen a whole song early
-            allow_pre = bool(queue_item.extra_attributes.get(ATTR_ALLOW_PRE))
-            tail_overlap = (
-                await self._plan_post(
-                    queue_item,
-                    item_id,
-                    media.duration,
-                    # a pre splits the break at the boundary instead of keeping a head aside
-                    half=allow_pre,
-                )
-                if queue_item.extra_attributes.get(ATTR_ALLOW_POST)
-                else None
-            )
-            pre_overlap, pre_from = (
-                self._plan_pre(queue_item, media.duration, tail_overlap)
-                if allow_pre
-                else (None, None)
-            )
-        # a re-render can shorten the break, so a plan from the previous pass must not stay
-        queue_item.extra_attributes.pop(ATTR_PRE_OVERLAP, None)
-        queue_item.extra_attributes.pop(ATTR_PRE_FROM, None)
-        if pre_overlap is not None and pre_from is not None:
-            # the stream reads how far the break reaches back from the clip item itself: the
-            # hold of the running record has to be armed before this plan exists
-            queue_item.extra_attributes[ATTR_PRE_OVERLAP] = pre_overlap
-            queue_item.extra_attributes[ATTR_PRE_FROM] = pre_from
+            # the post loads the next track's stream details, which must not happen a whole
+            # song early; the head only needs the track before it and is planned on its own
+            tail_overlap = await self._plan_overlaps(queue_item, item_id, media.duration)
 
         streamdetails = StreamDetails(
             provider=self.instance_id,
@@ -296,7 +272,11 @@ class AIRadioRenderMixin:
             # a failed render is logged and leaves the clip unplayable, so the queue skips it
             # once it is due instead of rendering it again
             with suppress(MediaNotFoundError):
-                await self._render_clip(queue_item, prompt, clip_id)
+                media = await self._render_clip(queue_item, prompt, clip_id)
+                # the head has to be known before the clip is due: the stream decides while
+                # the track before it still plays whether to hold that track's tail back
+                if queue_item.extra_attributes.get(ATTR_ALLOW_PRE):
+                    self._publish_pre(queue_item, self._plan_pre(queue_item, media.duration, None))
 
     async def _render_clip(
         self, queue_item: QueueItem, prompt: str, clip_id: str
@@ -746,15 +726,69 @@ class AIRadioRenderMixin:
             self._pre_skipped(previous.name, "the queue plays without crossfade")
             return None, None
         tail = tail_overlap.duration if tail_overlap is not None else 0.0
-        overlap = min(clip_duration - tail, TALK_OVER_MAX_PRE)
+        # the stream never blends more than half of the incoming item, so a longer head would
+        # be silently cut back; keeping the plan inside that bound makes log and audio agree
+        overlap = min(clip_duration - tail, TALK_OVER_MAX_PRE, clip_duration / 2)
         if overlap < MIN_PRE_SECONDS:
             return None, None
-        self.logger.info(
+        self.logger.debug(
             "AI Radio pre armed over %s: first %.1fs of the break over its tail",
             previous.name,
             overlap,
         )
         return round(overlap, 3), previous.queue_item_id
+
+    async def _plan_overlaps(
+        self, queue_item: QueueItem, clip_id: str, clip_duration: int | None
+    ) -> TailOverlap | None:
+        """
+        Plan both overlaps of a rendered clip and publish its head, returning the tail.
+
+        :param queue_item: The clip being rendered.
+        :param clip_id: Id of the clip, for the plan cache.
+        :param clip_duration: Length of the rendered break in seconds.
+        """
+        allow_pre = bool(queue_item.extra_attributes.get(ATTR_ALLOW_PRE))
+        tail_overlap = (
+            await self._plan_post(
+                queue_item,
+                clip_id,
+                clip_duration,
+                # a pre splits the break at the boundary instead of keeping a head aside
+                half=allow_pre,
+            )
+            if queue_item.extra_attributes.get(ATTR_ALLOW_POST)
+            else None
+        )
+        if allow_pre:
+            self._publish_pre(queue_item, self._plan_pre(queue_item, clip_duration, tail_overlap))
+        return tail_overlap
+
+    def _publish_pre(self, queue_item: QueueItem, planned: tuple[float | None, str | None]) -> None:
+        """
+        Store the planned head on the clip item, or clear a plan from an earlier pass.
+
+        :param queue_item: The clip the head belongs to.
+        :param planned: The head length and the item it was planned against, if any.
+        """
+        overlap, planned_against = planned
+        if overlap is None or planned_against is None:
+            # a re-render can empty the plan, and a stale one must not outlive it
+            queue_item.extra_attributes.pop(ATTR_PRE_OVERLAP, None)
+            queue_item.extra_attributes.pop(ATTR_PRE_FROM, None)
+            return
+        # the stream reads how far the break reaches back from the clip item itself
+        queue_item.extra_attributes[ATTR_PRE_OVERLAP] = overlap
+        queue_item.extra_attributes[ATTR_PRE_FROM] = planned_against
+        # DEBUG-INSTRUMENTATION (ci branch): who published what, on which object
+        self.logger.debug(
+            "LEAD-PUBLISH item=%s obj=%s pre=%.2fs from=%s queue=%s",
+            queue_item.queue_item_id,
+            id(queue_item),
+            overlap,
+            planned_against,
+            queue_item.queue_id,
+        )
 
     def _pre_skipped(self, track_name: str, reason: str) -> None:
         """
