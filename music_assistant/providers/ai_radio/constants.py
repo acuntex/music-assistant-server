@@ -115,9 +115,6 @@ TTS_SERVER_ERROR_MARKERS = ("Server returned 5XX", "HTTP error 5")
 # recover on their own, so each keeps its own count and its own pause
 RENDER_FAILURES_BEFORE_COOLDOWN = 3
 AI_COOLDOWN_SECONDS = 15 * 60
-# the pre-term render code still reads one engine-independent cool-down; it goes with the
-# render rewrite that counts each engine on its own
-RENDER_COOLDOWN_SECONDS = AI_COOLDOWN_SECONDS
 TTS_COOLDOWN_SECONDS = 5 * 60
 
 DEFAULT_TTS_LOUDNESS_BOOST = 3

@@ -119,28 +119,40 @@ def test_normalize_section_normalizes_invalid_web_search_and_constraints() -> No
     assert normalized["constraints"] == {"max_chars": 450}
 
 
+_UNSET = object()
+
+
+@pytest.mark.parametrize("field", ["allow_pre", "allow_post"])
 @pytest.mark.parametrize(
-    ("section_fields", "expected"),
+    ("value", "expected"),
     [
-        pytest.param({"allow_post": True}, {"allow_post": True}, id="on"),
-        pytest.param({"allow_post": 1}, {"allow_post": True}, id="truthy becomes a real bool"),
-        pytest.param({"allow_post": False}, {}, id="off is not stored"),
-        pytest.param({"allow_post": None}, {}, id="none is not stored"),
-        pytest.param({}, {}, id="never set"),
+        pytest.param(True, True, id="on"),
+        pytest.param(1, True, id="truthy becomes a real bool"),
+        pytest.param(False, None, id="off is not stored"),
+        pytest.param(None, None, id="none is not stored"),
+        pytest.param(_UNSET, None, id="never set"),
     ],
 )
-def test_normalize_section_stores_allow_post_only_when_on(
-    section_fields: dict[str, Any], expected: dict[str, Any]
+def test_normalize_section_stores_an_opt_in_only_when_on(
+    field: str, value: Any, expected: bool | None
 ) -> None:
-    """A section that never opted in comes back without the key, as the presets do."""
+    """
+    A section that never opted in comes back without the key, for both overlap halves.
+
+    Only an opted-in half is written, and each one is on its own: setting the head says
+    nothing about the tail, and a missing key reads as off everywhere.
+    """
     storage = DummyStorage()
+    fields = {} if value is _UNSET else {field: value}
+    other = "allow_post" if field == "allow_pre" else "allow_pre"
 
     normalized = storage._normalize_section(
         {"id": "back_announce", "name": "Back announce", "type": "ai_text", "prompt": "Talk."}
-        | section_fields
+        | fields
     )
 
-    assert {key: normalized[key] for key in normalized if key == "allow_post"} == expected
+    assert normalized.get(field) is expected
+    assert other not in normalized
 
 
 def test_normalize_station_rejects_missing_source_playlist_id() -> None:

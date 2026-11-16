@@ -11,29 +11,72 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
-from music_assistant_models.enums import EventType, MediaType
+from music_assistant_models.enums import (
+    ContentType,
+    CrossfadeMode,
+    EventType,
+    MediaType,
+    PlaybackState,
+)
 from music_assistant_models.errors import (
     InsufficientPermissions,
     InvalidDataError,
     MusicAssistantError,
 )
 from music_assistant_models.event import MassEvent
+from music_assistant_models.media_items import AudioFormat
 
+from music_assistant.controllers.streams.constants import LEAD_MIN_LEAD_SECONDS
+from music_assistant.controllers.streams.controller import ScheduleReason, ScheduleResult
+from music_assistant.controllers.streams.program_schedule import ProgramKind
+from music_assistant.providers.ai_radio import queue_dj as queue_dj_module
 from music_assistant.providers.ai_radio.constants import (
     ATTR_GAP_NEXT_ID,
     ATTR_HOST_ID,
     ATTR_QUEUE_DJ,
     ATTR_SESSION_ID,
+    CONF_PLAY_INTRO_ON_ACTIVATE,
     EVENT_QUEUE_DJ_UPDATED,
-    RENDER_COOLDOWN_SECONDS,
+    INTRO_RENDER_TIMEOUT_SECONDS,
+    OVERLAY_LABEL_INTRO,
+    OVERLAY_LABEL_TRANSITION,
+    PROGRAM_BUS_OFF_HINT,
+    PROGRAM_BUS_OFF_LINK,
+    RENDER_FAILURES_BEFORE_COOLDOWN,
+    TTS_COOLDOWN_SECONDS,
 )
+from music_assistant.providers.ai_radio.intro import AIRadioIntroMixin
 from music_assistant.providers.ai_radio.media import AIRadioMediaMixin
-from music_assistant.providers.ai_radio.models import PlannedSection
-from music_assistant.providers.ai_radio.queue_dj import AIRadioQueueDJMixin
+from music_assistant.providers.ai_radio.models import (
+    DJQueueState,
+    EngineRenderError,
+    PlannedSection,
+    RenderPart,
+)
+from music_assistant.providers.ai_radio.queue_dj import AIRadioQueueDJMixin, _gap_can_air
 from music_assistant.providers.ai_radio.runtime import AIRadioRuntimeMixin
 from music_assistant.providers.ai_radio.storage import AIRadioStorageMixin
+from music_assistant.providers.ai_radio.term_engine import BUS_GRACE_SECONDS, AIRadioTermEngineMixin
+from music_assistant.providers.ai_radio.term_timing import (
+    TERM_SCHEDULE_TOLERANCE_SECONDS,
+    TERM_START_BIAS_SECONDS,
+)
+from music_assistant.providers.ai_radio.terms import BoundaryState, ProgramTerm, TermState
 
 from .events import ProviderEventRecorder
+
+# the PCM format a live flow session delivers a program in
+PLAYBACK_PCM_FORMAT = AudioFormat(
+    content_type=ContentType.PCM_S16LE,
+    sample_rate=48000,
+    bit_depth=16,
+    channels=2,
+)
+# seconds of a spoken overlay stand-in a test renders unless it says otherwise
+OVERLAY_PCM_SECONDS = 3.0
+# the running track's length and how far into it the queue stands in the overlay tests
+TRACK_SECONDS = 200
+POSITION_SECONDS = 120
 
 
 class FakeQueue:
@@ -46,6 +89,9 @@ class FakeQueue:
         index_in_buffer: int | None,
         sources: list[Any] | None = None,
         ended: bool = False,
+        state: PlaybackState = PlaybackState.PLAYING,
+        current_item: FakeQueueItem | None = None,
+        elapsed_time: float = 0.0,
     ) -> None:
         """Initialize the fake queue with its playback pointers."""
         self.queue_id = queue_id
@@ -53,6 +99,9 @@ class FakeQueue:
         self.index_in_buffer = index_in_buffer
         self.sources = sources or []
         self.ended = ended
+        self.state = state
+        self.current_item = current_item
+        self.corrected_elapsed_time = elapsed_time
 
 
 class FakeQueueItem:
@@ -71,6 +120,8 @@ class FakeQueueItem:
         self.name = name
         self.duration = duration
         self.media_item = None
+        self.streamdetails = None
+        self.available = True
         self.extra_attributes: dict[str, Any] = dict(extra or {})
 
 
@@ -121,19 +172,142 @@ class FakeMass:
     def __init__(self, player_queues: FakePlayerQueues) -> None:
         """Initialize with the fake player queues controller."""
         self.player_queues = player_queues
+        self.config = StubConfig()
         self.tasks: list[asyncio.Task[Any]] = []
         self._tasks_by_id: dict[str, asyncio.Task[Any]] = {}
         self.timers: list[tuple[float, Callable[..., Any], tuple[Any, ...], str | None]] = []
         # (queue_id, required) for every boundary-mix requirement the DJ placed or released
         self.boundary_mix_calls: list[tuple[str, bool]] = []
+        # the same, for the claim that holds a queue's tails for a lead
+        self.lead_hold_calls: list[tuple[str, bool]] = []
         # the players the DJ asked to keep
         self.kept_players: list[str] = []
         self.players = SimpleNamespace(keep_player=self.kept_players.append)
+        # and for the claim that streams the queue in flow mode, which the program bus needs
+        self.flow_mode_calls: list[tuple[str, bool]] = []
+        # the owner every flow claim was placed under
+        self.flow_claim_owners: list[tuple[str, str]] = []
+
+        def _set_boundary_mix(queue_id: str, _owner: str, required: bool) -> None:
+            self.boundary_mix_calls.append((queue_id, required))
+
+        def _set_lead_hold(queue_id: str, _owner: str, required: bool) -> None:
+            self.lead_hold_calls.append((queue_id, required))
+
+        def _set_flow_mode(queue_id: str, owner: str, required: bool) -> None:
+            self.flow_mode_calls.append((queue_id, required))
+            if required:
+                self.flow_claim_owners.append((queue_id, owner))
+
         self.streams = SimpleNamespace(
-            set_boundary_mix_required=lambda queue_id, _owner, required: (
-                self.boundary_mix_calls.append((queue_id, required))
-            )
+            set_boundary_mix_required=_set_boundary_mix,
+            set_lead_hold_required=_set_lead_hold,
+            set_flow_mode_required=_set_flow_mode,
         )
+        self._init_program_bus()
+
+    def _init_program_bus(self) -> None:
+        """Wire the program bus stubs the overlay paths talk to."""
+        self.streams.program_bus_enabled_flag = False
+        self.bus_queues: set[str] = set()
+        # the seconds the queue's producer runs ahead of what the listener heard, as the
+        # bus reports them; None is a bus that can not tell
+        self.streams.program_bus_lead_value = None
+        # the queue's effective crossfade mode, which moves a boundary earlier
+        self.streams.crossfade_mode = CrossfadeMode.DISABLED
+        # what the streams ledger reports about the programs placed on the queue
+        self.streams.overlay_states: list[Any] = []
+        # every program the DJ took back from the bus
+        self.streams.cancelled: list[tuple[str, str, str, int | None]] = []
+        # (queue_id, pcm, label, start_in_seconds) for every program the DJ mixed in
+        self.overlays: list[tuple[str, bytes, str, float]] = []
+        # the priority and kind the caller claimed for each of them
+        self.overlay_priorities: list[object] = []
+        self.overlay_kinds: list[object] = []
+        # the head each program was planned to start with before its boundary
+        self.overlay_heads: list[float] = []
+        # (queue_id, voice db, duck db) for every level the DJ handed to the queue's bus
+        self.program_levels: list[tuple[str, float, float | None]] = []
+
+        def _program_bus_enabled() -> bool:
+            return cast("bool", self.streams.program_bus_enabled_flag)
+
+        def _program_bus_active(queue_id: str) -> bool:
+            return queue_id in self.bus_queues
+
+        def _program_bus_format(queue_id: str) -> AudioFormat | None:
+            return PLAYBACK_PCM_FORMAT if queue_id in self.bus_queues else None
+
+        def _program_bus_lead_seconds(_queue_id: str) -> float | None:
+            return cast("float | None", self.streams.program_bus_lead_value)
+
+        def _schedule_overlay(
+            queue_id: str,
+            pcm: bytes,
+            *,
+            label: str,
+            start_in_seconds: float = 0.0,
+            priority: object = None,
+            kind: object = None,
+            head_seconds: float = 0.0,
+        ) -> ScheduleResult:
+            if queue_id not in self.bus_queues:
+                return ScheduleResult(
+                    scheduled=False,
+                    anchor_frame=0,
+                    frames=0,
+                    late_by_seconds=0.0,
+                    lead_shortfall_seconds=0.0,
+                    reason=ScheduleReason.NO_BUS,
+                )
+            self.overlays.append((queue_id, pcm, label, start_in_seconds))
+            self.overlay_priorities.append(priority)
+            self.overlay_kinds.append(kind)
+            self.overlay_heads.append(head_seconds)
+            return ScheduleResult(
+                scheduled=True,
+                anchor_frame=0,
+                frames=0,
+                late_by_seconds=0.0,
+                lead_shortfall_seconds=0.0,
+                reason=None,
+            )
+
+        def _get_crossfade_mode(_queue: Any) -> Any:
+            return self.streams.crossfade_mode
+
+        def _overlay_state(_queue_id: str) -> list[Any]:
+            return self.streams.overlay_states
+
+        def _set_program_levels(
+            queue_id: str, *, voice_db: float = 0.0, duck_db: float | None = None
+        ) -> None:
+            self.program_levels.append((queue_id, voice_db, duck_db))
+
+        def _cancel_overlay(
+            queue_id: str, label: str, reason: str, *, start_frame: int | None = None
+        ) -> bool:
+            self.streams.cancelled.append((queue_id, label, reason, start_frame))
+            return True
+
+        self.streams.program_bus_enabled = _program_bus_enabled
+        self.streams.program_bus_active = _program_bus_active
+        self.streams.program_bus_format = _program_bus_format
+        self.streams.program_bus_lead_seconds = _program_bus_lead_seconds
+        self.streams.schedule_overlay = _schedule_overlay
+        self.streams.get_crossfade_mode = _get_crossfade_mode
+        self.streams.overlay_state = _overlay_state
+        self.streams.cancel_overlay = _cancel_overlay
+        self.streams.set_program_levels = _set_program_levels
+
+    def activate_program_bus(self, queue_id: str) -> None:
+        """Let the queue report a live flow session that mixes programs."""
+        self.streams.program_bus_enabled_flag = True
+        self.bus_queues.add(queue_id)
+
+    def drop_program_bus(self, queue_id: str) -> None:
+        """Withdraw the queue's flow session, as a stream that ended does."""
+        self.bus_queues.discard(queue_id)
 
     def create_task(
         self, target: Coroutine[Any, Any, Any], task_id: str | None = None
@@ -166,9 +340,62 @@ class StubConfig:
         """Return the default for every config key."""
         return default
 
+    def get_raw_core_config_value(self, domain: str, key: str, default: Any = None) -> Any:
+        """Return the default for every core config value, the crossfade length included."""
+        return default
+
+
+class OverlayStubs:
+    """Config and engine stand-ins shared by the harnesses that mix programs in."""
+
+    def _init_overlay_stubs(self) -> None:
+        """Reset what a test configured and what the harness rendered."""
+        self.config_values: dict[str, Any] = {}
+        # (host id, section id) of every section rendered for an overlay
+        self.rendered: list[tuple[str, str]] = []
+        self.fail_overlay_render = False
+        # which engine a failing overlay render stands in for
+        self.fail_overlay_part = RenderPart.TTS
+
+    def get_config_value(
+        self,
+        key: str,
+        default: Any = None,
+        *,
+        return_type: Any = None,
+    ) -> Any:
+        """Return what the test configured for the key, or the default."""
+        return self.config_values.get(key, default)
+
+    async def _render_section_pcm(
+        self,
+        queue_id: str,
+        program: dict[str, Any],
+        section: PlannedSection,
+        pcm_format: AudioFormat,
+    ) -> bytes:
+        """Return a stand-in clip in the flow's format, or fail as a broken engine does."""
+        self.rendered.append((str(program.get("host_id") or ""), section.section_id))
+        if self.fail_overlay_render:
+            # an engine that is down fails the render, and only its own bucket pauses
+            raise EngineRenderError(
+                self.fail_overlay_part,
+                f"{self.fail_overlay_part.label} 'engine-x'",
+                "engine down",
+            )
+        frames = int(OVERLAY_PCM_SECONDS * pcm_format.sample_rate)
+        return b"\x00\x00" * (frames * pcm_format.channels)
+
 
 class DummyQueueDJ(
-    ProviderEventRecorder, AIRadioQueueDJMixin, AIRadioStorageMixin, AIRadioMediaMixin
+    OverlayStubs,
+    ProviderEventRecorder,
+    AIRadioRuntimeMixin,
+    AIRadioTermEngineMixin,
+    AIRadioIntroMixin,
+    AIRadioQueueDJMixin,
+    AIRadioStorageMixin,
+    AIRadioMediaMixin,
 ):
     """Minimal harness for queue DJ state tests."""
 
@@ -177,6 +404,8 @@ class DummyQueueDJ(
     def __init__(self, tmp_path: Path) -> None:
         """Initialize dummy mixin state."""
         self.logger = logging.getLogger(__name__)
+        self.config = cast("Any", StubConfig())
+        self._init_overlay_stubs()
         self._hosts: dict[str, dict[str, Any]] = {
             "rick": {"id": "rick", "name": "Rick", "instructions": "x", "tts_engine": ""},
         }
@@ -220,7 +449,9 @@ def _player_removed(queue_id: str) -> MassEvent:
     return MassEvent(EventType.PLAYER_REMOVED, queue_id)
 
 
-def _fake_queue_with_sources(dj: DummyQueueDJ, queue_id: str, source_uris: list[str]) -> FakeQueue:
+def _fake_queue_with_sources(
+    dj: DummyQueueDJ | ReplanQueueDJ, queue_id: str, source_uris: list[str]
+) -> FakeQueue:
     """Register a fake queue exposing the given source uris on the harness's player_queues."""
     sources = [SimpleNamespace(uri=uri) for uri in source_uris]
     queue = FakeQueue(queue_id, None, None, sources=sources)
@@ -229,8 +460,11 @@ def _fake_queue_with_sources(dj: DummyQueueDJ, queue_id: str, source_uris: list[
 
 
 class ReplanQueueDJ(
+    OverlayStubs,
     ProviderEventRecorder,
     AIRadioRuntimeMixin,
+    AIRadioTermEngineMixin,
+    AIRadioIntroMixin,
     AIRadioQueueDJMixin,
     AIRadioStorageMixin,
     AIRadioMediaMixin,
@@ -250,6 +484,7 @@ class ReplanQueueDJ(
         """Initialize the harness around one fake queue."""
         self.logger = logging.getLogger(__name__)
         self.config = cast("Any", StubConfig())
+        self._init_overlay_stubs()
         self._sections = {_transition_section()["id"]: _transition_section()}
         self._hosts: dict[str, dict[str, Any]] = {host["id"]: host}
         self._stations: dict[str, dict[str, Any]] = {}
@@ -399,11 +634,86 @@ def _make_replan_dj(
     return dummy
 
 
+def _status_entry(
+    host_id: str,
+    station_id: str = "",
+    voice_level_db: float = 0.0,
+    duck_db: float | None = None,
+    *,
+    bus_off: bool = True,
+) -> dict[str, Any]:
+    """Return the status entry of one armed queue DJ, with the bus off by default."""
+    entry: dict[str, Any] = {
+        "host_id": host_id,
+        "station_id": station_id,
+        "voice_level_db": voice_level_db,
+        "duck_db": duck_db,
+        "bus_enabled": not bus_off,
+        "hint": PROGRAM_BUS_OFF_HINT if bus_off else None,
+        "hint_link": PROGRAM_BUS_OFF_LINK if bus_off else None,
+    }
+    return entry
+
+
+async def test_arming_the_dj_with_the_bus_off_hints_at_the_switch(tmp_path: Path) -> None:
+    """The hint is shown, and the DJ is armed anyway: the switch is never refused."""
+    dummy = DummyQueueDJ(tmp_path)
+
+    entry = (await dummy.set_queue_dj("queue-1", "rick"))["queue-1"]
+
+    assert entry["bus_enabled"] is False
+    assert entry["hint"]
+    assert entry["hint_link"] == PROGRAM_BUS_OFF_LINK
+    # the DJ speaks as soon as the bus is on, so arming it was the right thing to do
+    assert dummy._dj_queues["queue-1"].host_id == "rick"
+    assert dummy.replanned == ["queue-1"]
+
+
+async def test_arming_the_dj_with_the_bus_on_hints_at_nothing(tmp_path: Path) -> None:
+    """A queue whose stream mixes programs needs no hint."""
+    dummy = DummyQueueDJ(tmp_path)
+    dummy.mass.activate_program_bus("queue-1")
+
+    entry = (await dummy.set_queue_dj("queue-1", "rick"))["queue-1"]
+
+    assert entry["bus_enabled"] is True
+    assert entry["hint"] is None
+    assert entry["hint_link"] is None
+
+
+async def test_the_status_answer_carries_the_same_hint(tmp_path: Path) -> None:
+    """A client that only reads the status sees the hint the switch reported."""
+    dummy = DummyQueueDJ(tmp_path)
+
+    armed = (await dummy.set_queue_dj("queue-1", "rick"))["queue-1"]
+    status = (await dummy.get_queue_dj_status())["queue-1"]
+
+    assert status["hint"] == armed["hint"]
+    assert status["bus_enabled"] is False
+
+
+async def test_the_hint_leaves_the_other_answer_fields_alone(tmp_path: Path) -> None:
+    """The answer keeps every field a client already reads, and adds the hint to them."""
+    dummy = DummyQueueDJ(tmp_path)
+
+    entry = (await dummy.set_queue_dj("queue-1", "rick"))["queue-1"]
+
+    assert entry | {"bus_enabled": None, "hint": None, "hint_link": None} == {
+        "host_id": "rick",
+        "station_id": "",
+        "voice_level_db": 0.0,
+        "duck_db": None,
+        "bus_enabled": None,
+        "hint": None,
+        "hint_link": None,
+    }
+
+
 async def test_set_queue_dj_enables_and_persists(tmp_path: Path) -> None:
     """Arm a queue DJ, persist it, and reload it into a fresh instance."""
     dummy = DummyQueueDJ(tmp_path)
     mapping = await dummy.set_queue_dj("queue-1", "rick")
-    assert mapping == {"queue-1": {"host_id": "rick", "station_id": ""}}
+    assert mapping == {"queue-1": _status_entry("rick")}
     assert dummy._dj_queues["queue-1"].host_id == "rick"
     assert dummy._dj_queues["queue-1"].dj_session_id
     assert dummy._dj_queues["queue-1"].ready is True
@@ -425,6 +735,29 @@ async def test_set_queue_dj_rejects_unknown_host(tmp_path: Path) -> None:
         await dummy.set_queue_dj("queue-1", "nobody")
 
 
+async def test_the_legacy_cleanup_gets_the_live_session_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A retried cleanup has to know which clips the session that runs now has spliced."""
+    dummy = DummyQueueDJ(tmp_path)
+    dummy._dj_queues["queue-1"] = DJQueueState(
+        queue_id="queue-1", host_id="rick", dj_session_id="dj-live"
+    )
+    seen: list[tuple[str, dict[str, str]]] = []
+
+    async def _record(
+        _mass: Any, _logger: Any, instance_id: str, live_session_ids: dict[str, str]
+    ) -> bool:
+        seen.append((instance_id, dict(live_session_ids)))
+        return False
+
+    monkeypatch.setattr(queue_dj_module, "remove_legacy_dj_items", _record)
+
+    await dummy._cleanup_legacy_dj_items()
+
+    assert seen == [("ai_radio_test", {"queue-1": "dj-live"})]
+
+
 async def test_set_queue_dj_none_disables(tmp_path: Path) -> None:
     """Disable an armed queue DJ by passing host_id=None."""
     dummy = DummyQueueDJ(tmp_path)
@@ -438,7 +771,277 @@ async def test_status_returns_mapping(tmp_path: Path) -> None:
     """Return the queue-to-host mapping for an armed queue DJ."""
     dummy = DummyQueueDJ(tmp_path)
     await dummy.set_queue_dj("queue-1", "rick")
-    assert await dummy.get_queue_dj_status() == {"queue-1": {"host_id": "rick", "station_id": ""}}
+    assert await dummy.get_queue_dj_status() == {"queue-1": _status_entry("rick")}
+
+
+async def test_a_queue_mixes_at_the_defaults_until_it_sets_its_own(tmp_path: Path) -> None:
+    """A freshly armed DJ speaks at full level and inherits the global duck."""
+    dummy = DummyQueueDJ(tmp_path)
+
+    mapping = await dummy.set_queue_dj("queue-1", "rick")
+
+    assert mapping["queue-1"]["voice_level_db"] == 0.0
+    assert mapping["queue-1"]["duck_db"] is None
+    # the queue's bus is told where to mix the voice, so the announcement path agrees
+    assert ("queue-1", 0.0, None) in dummy.mass.program_levels
+
+
+async def test_setting_the_levels_persists_them_and_tells_the_bus(tmp_path: Path) -> None:
+    """A queue keeps its own voice level and ducking depth, and the bus mixes at them."""
+    dummy = DummyQueueDJ(tmp_path)
+    await dummy.set_queue_dj("queue-1", "rick")
+
+    await dummy.set_queue_dj_voice_level("queue-1", voice_level_db=-6)
+    mapping = await dummy.set_queue_dj_duck("queue-1", duck_db=-12)
+
+    assert mapping == {"queue-1": _status_entry("rick", voice_level_db=-6.0, duck_db=-12.0)}
+    assert dummy.mass.program_levels[-1] == ("queue-1", -6.0, -12.0)
+
+
+async def test_setting_only_the_duck_keeps_the_voice_level_it_had(tmp_path: Path) -> None:
+    """A ui that saves one slider does not reset the other setting to its default."""
+    dummy = DummyQueueDJ(tmp_path)
+    await dummy.set_queue_dj("queue-1", "rick")
+    await dummy.set_queue_dj_voice_level("queue-1", voice_level_db=-6)
+
+    mapping = await dummy.set_queue_dj_duck("queue-1", duck_db=-3)
+
+    assert (mapping["queue-1"]["voice_level_db"], mapping["queue-1"]["duck_db"]) == (-6.0, -3.0)
+    assert dummy.mass.program_levels[-1] == ("queue-1", -6.0, -3.0)
+
+
+async def test_setting_only_the_voice_level_keeps_the_duck_it_had(tmp_path: Path) -> None:
+    """The other side of the same coin: the duck stays where the queue put it."""
+    dummy = DummyQueueDJ(tmp_path)
+    await dummy.set_queue_dj("queue-1", "rick")
+    await dummy.set_queue_dj_duck("queue-1", duck_db=-12)
+
+    mapping = await dummy.set_queue_dj_voice_level("queue-1", voice_level_db=-4.5)
+
+    assert (mapping["queue-1"]["voice_level_db"], mapping["queue-1"]["duck_db"]) == (
+        -4.5,
+        -12.0,
+    )
+    assert dummy.mass.program_levels[-1] == ("queue-1", -4.5, -12.0)
+
+
+async def test_both_commands_set_the_two_independent_levels(tmp_path: Path) -> None:
+    """A settings dialog may still carry both sliders, one call per setter."""
+    dummy = DummyQueueDJ(tmp_path)
+    await dummy.set_queue_dj("queue-1", "rick")
+    await dummy.set_queue_dj_voice_level("queue-1", voice_level_db=-6)
+
+    await dummy.set_queue_dj_voice_level("queue-1", voice_level_db=-9)
+    mapping = await dummy.set_queue_dj_duck("queue-1", duck_db=-12)
+
+    assert (mapping["queue-1"]["voice_level_db"], mapping["queue-1"]["duck_db"]) == (-9.0, -12.0)
+
+
+async def test_an_explicit_null_returns_the_voice_level_to_its_default(tmp_path: Path) -> None:
+    """None is a value, not an omission: the queue speaks at 0 dB again, the duck stays."""
+    dummy = DummyQueueDJ(tmp_path)
+    await dummy.set_queue_dj("queue-1", "rick")
+    await dummy.set_queue_dj_voice_level("queue-1", voice_level_db=-6)
+    await dummy.set_queue_dj_duck("queue-1", duck_db=-12)
+
+    mapping = await dummy.set_queue_dj_voice_level("queue-1", voice_level_db=None)
+
+    assert mapping["queue-1"]["voice_level_db"] == 0.0
+    assert mapping["queue-1"]["duck_db"] == -12.0
+
+
+async def test_an_explicit_null_returns_the_duck_to_the_global_depth(tmp_path: Path) -> None:
+    """The duck's own default is 'inherit the depth the bus mixes every queue with'."""
+    dummy = DummyQueueDJ(tmp_path)
+    await dummy.set_queue_dj("queue-1", "rick")
+    await dummy.set_queue_dj_voice_level("queue-1", voice_level_db=-6)
+    await dummy.set_queue_dj_duck("queue-1", duck_db=-12)
+
+    mapping = await dummy.set_queue_dj_duck("queue-1", duck_db=None)
+
+    assert mapping["queue-1"]["duck_db"] is None
+    assert mapping["queue-1"]["voice_level_db"] == -6.0
+    assert dummy.mass.program_levels[-1] == ("queue-1", -6.0, None)
+
+
+async def test_the_levels_survive_a_restart(tmp_path: Path) -> None:
+    """A restored DJ reads its levels back and hands them to the new stream's bus."""
+    dummy = DummyQueueDJ(tmp_path)
+    await dummy.set_queue_dj("queue-1", "rick")
+    await dummy.set_queue_dj_voice_level("queue-1", voice_level_db=-4.5)
+    await dummy.set_queue_dj_duck("queue-1", duck_db=-12)
+
+    fresh = DummyQueueDJ(tmp_path)
+    await fresh._load_queue_dj()
+
+    state = fresh._dj_queues["queue-1"]
+    assert (state.voice_level_db, state.duck_db) == (-4.5, -12.0)
+    assert fresh.mass.program_levels[-1] == ("queue-1", -4.5, -12.0)
+
+
+async def test_a_stored_dj_state_without_the_levels_reads_the_defaults(tmp_path: Path) -> None:
+    """A queue DJ file written before the settings existed still loads its host."""
+    dummy = DummyQueueDJ(tmp_path)
+    dummy._dj_file.write_text(
+        '{"version": 1, "queues": {"queue-1": {"host_id": "rick", "station_id": ""}}}'
+    )
+
+    await dummy._load_queue_dj()
+
+    state = dummy._dj_queues["queue-1"]
+    assert state.host_id == "rick"
+    assert (state.voice_level_db, state.duck_db) == (0.0, None)
+    assert dummy.mass.program_levels == [("queue-1", 0.0, None)]
+
+
+async def test_setting_the_levels_of_a_queue_without_a_dj_is_refused(tmp_path: Path) -> None:
+    """Levels belong to an armed DJ, so a queue that runs none can not set them."""
+    dummy = DummyQueueDJ(tmp_path)
+
+    with pytest.raises(InvalidDataError, match="queue-1"):
+        await dummy.set_queue_dj_voice_level("queue-1", voice_level_db=-6)
+    with pytest.raises(InvalidDataError, match="queue-1"):
+        await dummy.set_queue_dj_duck("queue-1", duck_db=-6)
+
+
+@pytest.mark.parametrize("voice_level_db", [-9.1, 0.5, "loud", True])
+async def test_a_voice_level_outside_its_range_is_refused(
+    tmp_path: Path, voice_level_db: Any
+) -> None:
+    """A value outside its range or of the wrong type is an error, not a clamp."""
+    dummy = DummyQueueDJ(tmp_path)
+    await dummy.set_queue_dj("queue-1", "rick")
+
+    with pytest.raises(InvalidDataError):
+        await dummy.set_queue_dj_voice_level("queue-1", voice_level_db=voice_level_db)
+
+
+@pytest.mark.parametrize("duck_db", [-12.1, 0.5, "deep", True])
+async def test_a_duck_outside_its_range_is_refused(tmp_path: Path, duck_db: Any) -> None:
+    """The ducking depth has its own range, and the same refusal."""
+    dummy = DummyQueueDJ(tmp_path)
+    await dummy.set_queue_dj("queue-1", "rick")
+
+    with pytest.raises(InvalidDataError):
+        await dummy.set_queue_dj_duck("queue-1", duck_db=duck_db)
+
+
+@pytest.mark.parametrize("voice_level_db", [0, -9, -4.5])
+async def test_the_bounds_of_the_voice_range_are_valid(tmp_path: Path, voice_level_db: Any) -> None:
+    """0 dB and the floor are settings a user may pick."""
+    dummy = DummyQueueDJ(tmp_path)
+    await dummy.set_queue_dj("queue-1", "rick")
+
+    mapping = await dummy.set_queue_dj_voice_level("queue-1", voice_level_db=voice_level_db)
+
+    assert mapping["queue-1"]["voice_level_db"] == pytest.approx(float(voice_level_db))
+
+
+@pytest.mark.parametrize("duck_db", [0, -12, -4.5, None])
+async def test_the_bounds_of_the_duck_range_are_valid(tmp_path: Path, duck_db: Any) -> None:
+    """0 dB and the floor are settings a user may pick, and None is 'inherit'."""
+    dummy = DummyQueueDJ(tmp_path)
+    await dummy.set_queue_dj("queue-1", "rick")
+
+    mapping = await dummy.set_queue_dj_duck("queue-1", duck_db=duck_db)
+
+    expected_duck = None if duck_db is None else float(duck_db)
+    if expected_duck is None:
+        assert mapping["queue-1"]["duck_db"] is None
+    else:
+        assert mapping["queue-1"]["duck_db"] == pytest.approx(expected_duck)
+
+
+async def test_a_host_switch_keeps_the_levels_of_the_queue(tmp_path: Path) -> None:
+    """The level belongs to the queue, so switching its host does not reset it."""
+    dummy = DummyQueueDJ(tmp_path)
+    dummy._hosts["amy"] = {"id": "amy", "name": "Amy", "instructions": "x", "tts_engine": ""}
+    await dummy.set_queue_dj("queue-1", "rick")
+    await dummy.set_queue_dj_voice_level("queue-1", voice_level_db=-6)
+    await dummy.set_queue_dj_duck("queue-1", duck_db=-12)
+
+    mapping = await dummy.set_queue_dj("queue-1", "amy")
+
+    assert mapping["queue-1"] == _status_entry("amy", voice_level_db=-6.0, duck_db=-12.0)
+
+
+async def test_disabling_the_dj_hands_the_defaults_back_to_the_bus(tmp_path: Path) -> None:
+    """A disabled DJ leaves no gain behind on the queue's announcements."""
+    dummy = DummyQueueDJ(tmp_path)
+    await dummy.set_queue_dj("queue-1", "rick")
+    await dummy.set_queue_dj_voice_level("queue-1", voice_level_db=-9)
+    await dummy.set_queue_dj_duck("queue-1", duck_db=-12)
+
+    await dummy.set_queue_dj("queue-1", None)
+
+    assert dummy.mass.program_levels[-1] == ("queue-1", 0.0, None)
+
+
+async def test_a_show_that_detaches_and_replays_keeps_the_level_of_its_queue(
+    tmp_path: Path,
+) -> None:
+    """The level belongs to the queue, so re-arming the show after a detach mixes it again."""
+    dj = _dj_harness(tmp_path)
+    _fake_queue_with_sources(dj, "q1", [f"{dj.instance_id}://radio/morning_show"])
+    await dj._ensure_show_dj("q1")
+    await dj.set_queue_dj_voice_level("q1", voice_level_db=-6)
+    await dj.set_queue_dj_duck("q1", duck_db=-12)
+
+    # the show ran out: its DJ detaches on the next event without the user asking for it
+    dj.mass.player_queues._queue.ended = True
+    await dj._maybe_detach_show_dj("q1")
+    assert "q1" not in dj._dj_queues
+
+    # the listener plays the show again
+    _fake_queue_with_sources(dj, "q1", [f"{dj.instance_id}://radio/morning_show"])
+    await dj._ensure_show_dj("q1")
+
+    state = dj._dj_queues["q1"]
+    assert state.host_id == "amy"
+    assert (state.voice_level_db, state.duck_db) == (-6.0, -12.0)
+    assert dj.mass.program_levels[-1] == ("q1", -6.0, -12.0)
+
+
+async def test_the_level_of_a_queue_survives_its_dj_being_switched_off_and_on(
+    tmp_path: Path,
+) -> None:
+    """A disabled DJ hands the bus defaults, and the queue's own level is not thrown away."""
+    dummy = DummyQueueDJ(tmp_path)
+    await dummy.set_queue_dj("queue-1", "rick")
+    await dummy.set_queue_dj_voice_level("queue-1", voice_level_db=-4.5)
+
+    await dummy.set_queue_dj("queue-1", None)
+    assert dummy.mass.program_levels[-1] == ("queue-1", 0.0, None)
+
+    mapping = await dummy.set_queue_dj("queue-1", "rick")
+
+    assert mapping["queue-1"]["voice_level_db"] == pytest.approx(-4.5)
+    assert dummy.mass.program_levels[-1] == ("queue-1", -4.5, None)
+
+
+async def test_a_removed_player_forgets_the_level_of_its_queue(tmp_path: Path) -> None:
+    """A player that is gone takes its queue's level with it instead of holding it forever."""
+    dummy = DummyQueueDJ(tmp_path)
+    await dummy.set_queue_dj("queue-1", "rick")
+    await dummy.set_queue_dj_voice_level("queue-1", voice_level_db=-9)
+
+    await dummy._on_dj_queue_event(_player_removed("queue-1"))
+
+    mapping = await dummy.set_queue_dj("queue-1", "rick")
+    assert mapping["queue-1"]["voice_level_db"] == 0.0
+
+
+async def test_the_item_path_keeps_its_clips_with_levels_set(tmp_path: Path) -> None:
+    """With the program bus off, the levels change nothing about the clips it splices."""
+    tracks = [_track(index) for index in range(4)]
+    dummy = _make_replan_dj(tmp_path, tracks)
+    await dummy.set_queue_dj_voice_level("queue-1", voice_level_db=-6)
+    await dummy.set_queue_dj_duck("queue-1", duck_db=-12)
+
+    await dummy._replan_queue("queue-1")
+
+    assert dummy.mass.overlays == []
+    assert {items[0].extra_attributes[ATTR_GAP_NEXT_ID] for items, _ in dummy.player_queues.loads}
 
 
 async def test_ensure_show_dj_arms_host_for_show_queue(tmp_path: Path) -> None:
@@ -469,6 +1072,27 @@ async def test_arming_a_posting_show_requires_mixed_boundaries(tmp_path: Path) -
     await dj._ensure_show_dj("q1")
 
     assert dj.mass.boundary_mix_calls == [("q1", True)]
+    # its break only plays into the item after the boundary, so no tail is held for a lead
+    assert dj.mass.lead_hold_calls == [("q1", False)]
+
+
+def _let_amy_lead(dj: DummyQueueDJ) -> None:
+    """Give host amy one section whose break starts over the outgoing track's tail."""
+    dj._sections["talk_over"] = {"id": "talk_over", "allow_pre": True}
+    dj._hosts["amy"]["section_ids"] = ["talk_over"]
+
+
+async def test_arming_a_leading_show_holds_the_queue_tails(tmp_path: Path) -> None:
+    """A show whose break starts over the outgoing tail claims the hold that carries a lead."""
+    dj = _dj_harness(tmp_path)
+    _let_amy_lead(dj)
+    _fake_queue_with_sources(dj, "q1", [f"{dj.instance_id}://radio/morning_show"])
+
+    await dj._ensure_show_dj("q1")
+
+    assert dj.mass.lead_hold_calls == [("q1", True)]
+    # the break straddles the boundary as well, so both claims are placed
+    assert dj.mass.boundary_mix_calls == [("q1", True)]
 
 
 async def test_arming_a_show_without_posting_sections_asks_for_nothing(tmp_path: Path) -> None:
@@ -478,7 +1102,8 @@ async def test_arming_a_show_without_posting_sections_asks_for_nothing(tmp_path:
 
     await dj._ensure_show_dj("q1")
 
-    assert dj.mass.boundary_mix_calls == []
+    assert dj.mass.boundary_mix_calls == [("q1", False)]
+    assert dj.mass.lead_hold_calls == [("q1", False)]
 
 
 async def test_disabling_the_show_dj_releases_the_requirement(tmp_path: Path) -> None:
@@ -628,6 +1253,24 @@ async def test_manually_armed_dj_is_never_auto_detached(tmp_path: Path) -> None:
     assert "q1" in dj._dj_queues
 
 
+async def test_detaching_a_show_dj_removes_its_pending_clips(tmp_path: Path) -> None:
+    """An auto-detach takes the show's pending clips out of the queue along with its state."""
+    tracks = [_track(index) for index in range(4)]
+    dummy = _make_replan_dj(tmp_path, list(tracks))
+    state = dummy._dj_queues["queue-1"]
+    state.station_id = "morning_show"
+    dummy._armed_show_queues["queue-1"] = "morning_show"
+    first = _dj_clip(tracks[2].queue_item_id, state.dj_session_id)
+    second = _dj_clip(tracks[3].queue_item_id, state.dj_session_id)
+    dummy.player_queues._items = [tracks[0], tracks[1], first, tracks[2], second, tracks[3]]
+
+    await dummy._maybe_detach_show_dj("queue-1")
+
+    assert "queue-1" not in dummy._dj_queues
+    assert "queue-1" not in dummy._armed_show_queues
+    assert {first.queue_item_id, second.queue_item_id} <= set(dummy.player_queues.deleted)
+
+
 async def test_status_includes_station_binding(tmp_path: Path) -> None:
     """The status payload surfaces the station a queue DJ is bound to."""
     dj = _dj_harness(tmp_path)
@@ -636,7 +1279,7 @@ async def test_status_includes_station_binding(tmp_path: Path) -> None:
 
     status = await dj.get_queue_dj_status()
 
-    assert status == {"q1": {"host_id": "amy", "station_id": "morning_show"}}
+    assert status == {"q1": _status_entry("amy", station_id="morning_show")}
 
 
 async def test_on_dj_queue_event_auto_arms_a_show_queue(tmp_path: Path) -> None:
@@ -710,6 +1353,34 @@ async def test_ending_the_queue_detaches_and_clears_the_armed_record(tmp_path: P
     await dj._ensure_show_dj("q1")
 
     assert dj._dj_queues["q1"].host_id == "amy"
+
+
+async def test_a_show_replay_earns_a_fresh_outro(tmp_path: Path) -> None:
+    """A replay of a finished show plans its outro again, exactly once."""
+    tracks = [_track(0), _track(1)]
+    queue = FakeQueue(
+        "queue-1", -1, -1, sources=[SimpleNamespace(uri="ai_radio_test://radio/morning_show")]
+    )
+    dummy = ReplanQueueDJ(tmp_path, queue, list(tracks), _outro_host())
+    dummy._stations["morning_show"] = {"id": "morning_show", "host_id": "rick"}
+
+    await dummy._ensure_show_dj("queue-1")
+    await _drain_tasks(dummy.mass)
+    assert len(_outro_clips(dummy)) == 1
+
+    # the show runs out, so its DJ detaches and the replay enqueues the songs again
+    queue.ended = True
+    await dummy._maybe_detach_show_dj("queue-1")
+    assert "queue-1" not in dummy._dj_queues
+
+    queue.ended = False
+    dummy.player_queues._items = [_track(10), _track(11)]
+    await dummy._ensure_show_dj("queue-1")
+    await _drain_tasks(dummy.mass)
+
+    outros = _outro_clips(dummy)
+    assert len(outros) == 1
+    assert dummy.player_queues.items("queue-1")[-1] is outros[0]
 
 
 async def test_on_dj_queue_event_forgets_armed_show_on_player_removed(tmp_path: Path) -> None:
@@ -820,6 +1491,83 @@ async def test_forget_armed_show_drops_the_record_once_sources_change(tmp_path: 
     assert "q1" not in dj._armed_show_queues
 
 
+async def test_gap_can_air_needs_the_outgoing_track_to_play() -> None:
+    """A track that could not start is no boundary to speak over."""
+    tracks = [{"item_id": "a", "available": False}, {"item_id": "b", "available": True}]
+
+    assert _gap_can_air(tracks, 1) is False
+
+
+def test_gap_can_air_needs_the_next_track_to_play() -> None:
+    """Neither is a break worth writing when the track it announces cannot play."""
+    tracks = [{"item_id": "a", "available": True}, {"item_id": "b", "available": False}]
+
+    assert _gap_can_air(tracks, 1) is False
+
+
+def test_gap_can_air_for_an_outro_needs_the_last_track() -> None:
+    """An outro after a track that cannot play has nothing to close."""
+    tracks = [{"item_id": "a", "available": True}, {"item_id": "b", "available": False}]
+
+    assert _gap_can_air(tracks, 2) is False
+
+
+def test_gap_can_air_allows_a_boundary_that_plays() -> None:
+    """Both sides can play, so the gap earns its break."""
+    tracks = [{"item_id": "a", "available": True}, {"item_id": "b", "available": True}]
+
+    assert _gap_can_air(tracks, 1) is True
+
+
+def test_repair_drops_a_break_behind_a_track_that_cannot_play(tmp_path: Path) -> None:
+    """A break behind a track that never started is removed, and stays decided."""
+    tracks = [_track(0), _track(1)]
+    dummy = _make_replan_dj(tmp_path, list(tracks))
+    state = dummy._dj_queues["queue-1"]
+    clip = _dj_clip(tracks[1].queue_item_id, state.dj_session_id)
+    tracks[0].available = False
+    dummy.player_queues._items = [tracks[0], clip, tracks[1]]
+
+    repaired = dummy._repair_dj_clips("queue-1", state, dummy.player_queues.items("queue-1"), -1)
+
+    assert repaired is True
+    assert clip.queue_item_id in dummy.player_queues.deleted
+    # re-deciding the gap would render another break for the next skipped track
+    assert tracks[1].queue_item_id in state.decided_gap_ids
+
+
+async def test_repair_drops_a_break_that_announces_a_track_that_cannot_play(
+    tmp_path: Path,
+) -> None:
+    """The break's announced track cannot play, so the break has nothing to hand over to."""
+    tracks = [_track(0), _track(1)]
+    dummy = _make_replan_dj(tmp_path, list(tracks))
+    state = dummy._dj_queues["queue-1"]
+    clip = _dj_clip(tracks[1].queue_item_id, state.dj_session_id)
+    tracks[1].available = False
+    dummy.player_queues._items = [tracks[0], clip, tracks[1]]
+
+    repaired = dummy._repair_dj_clips("queue-1", state, dummy.player_queues.items("queue-1"), -1)
+
+    assert repaired is True
+    assert clip.queue_item_id in dummy.player_queues.deleted
+    assert tracks[1].queue_item_id in state.decided_gap_ids
+
+
+async def test_repair_keeps_a_break_in_front_of_a_track_that_plays(tmp_path: Path) -> None:
+    """Both boundaries can play, so the break stays and its gap is not closed."""
+    tracks = [_track(0), _track(1)]
+    dummy = _make_replan_dj(tmp_path, list(tracks))
+    state = dummy._dj_queues["queue-1"]
+    clip = _dj_clip(tracks[1].queue_item_id, state.dj_session_id)
+    dummy.player_queues._items = [tracks[0], clip, tracks[1]]
+
+    repaired = dummy._repair_dj_clips("queue-1", state, dummy.player_queues.items("queue-1"), -1)
+
+    assert repaired is False
+    assert dummy.player_queues.deleted == []
+
+
 async def test_repair_never_treats_a_trailing_outro_as_stale(tmp_path: Path) -> None:
     """An outro clip carries no gap-next id, so repair must not delete it for lacking one."""
     tracks = [_track(index) for index in range(2)]
@@ -836,6 +1584,25 @@ async def test_repair_never_treats_a_trailing_outro_as_stale(tmp_path: Path) -> 
 
     assert repaired is False
     assert dummy.player_queues.deleted == []
+
+
+async def test_repair_leaves_a_clip_the_player_owns_alone(tmp_path: Path) -> None:
+    """A stale clip in the player's owned head stays put, only the ones beyond it are repaired."""
+    tracks = [_track(index) for index in range(4)]
+    dummy = _make_replan_dj(tmp_path, list(tracks))
+    state = dummy._dj_queues["queue-1"]
+    owned = _dj_clip("vanished-item", state.dj_session_id)
+    beyond = _dj_clip("vanished-item", state.dj_session_id)
+    # the guard sits on track 1, so the clip one slot past it is still the player's to take
+    dummy.player_queues._items = [tracks[0], tracks[1], owned, tracks[2], beyond, tracks[3]]
+
+    repaired = dummy._repair_dj_clips(
+        "queue-1", state, dummy.player_queues.items("queue-1"), guard_index=1
+    )
+
+    assert repaired is True
+    assert dummy.player_queues.deleted == [beyond.queue_item_id]
+    assert owned in dummy.player_queues.items("queue-1")
 
 
 async def test_splice_dj_clip_inserts_after_the_last_window_track(tmp_path: Path) -> None:
@@ -873,6 +1640,106 @@ async def test_splice_dj_clip_inserts_after_the_last_window_track(tmp_path: Path
     assert items[-1].extra_attributes.get(ATTR_GAP_NEXT_ID) is None
 
 
+def _splice_gap(
+    dummy: ReplanQueueDJ,
+    items: list[Any],
+    target_id: str,
+    *,
+    guard_index: int = -1,
+    after_target: bool = False,
+) -> str:
+    """Attempt one splice of the harness's DJ program and return its outcome."""
+    section = _gap_section()
+    if after_target:
+        section.when = "end_of_playlist"
+    return dummy._splice_dj_clip(
+        queue_id="queue-1",
+        items=items,
+        guard_index=guard_index,
+        state=dummy._dj_queues["queue-1"],
+        program=_dj_program(dummy),
+        target={"item_id": target_id},
+        section=section,
+        after_target=after_target,
+    )
+
+
+def test_splice_returns_too_close_before_the_guard_slot(tmp_path: Path) -> None:
+    """A target one slot past the guard is not spliced, and the pass spends no clip id."""
+    tracks = [_track(index) for index in range(4)]
+    dummy = _make_replan_dj(tmp_path, list(tracks))
+    state = dummy._dj_queues["queue-1"]
+    items = list(dummy.player_queues.items("queue-1"))
+    before = list(items)
+
+    outcome = _splice_gap(dummy, items, tracks[2].queue_item_id, guard_index=1)
+
+    assert outcome == "too_close"
+    assert items == before
+    assert state.clip_counter == 0
+
+
+def test_splice_returns_occupied_for_a_gap_that_already_has_a_clip(tmp_path: Path) -> None:
+    """A gap that already holds a clip is not spliced a second time."""
+    tracks = [_track(index) for index in range(4)]
+    dummy = _make_replan_dj(tmp_path, list(tracks))
+    state = dummy._dj_queues["queue-1"]
+    existing = _dj_clip(tracks[2].queue_item_id, state.dj_session_id)
+    dummy.player_queues._items = [tracks[0], tracks[1], existing, tracks[2], tracks[3]]
+    items = list(dummy.player_queues.items("queue-1"))
+    before = list(items)
+
+    outcome = _splice_gap(dummy, items, tracks[2].queue_item_id)
+
+    assert outcome == "occupied"
+    assert items == before
+    assert state.clip_counter == 0
+
+
+def test_splice_returns_gap_gone_for_a_target_that_left(tmp_path: Path) -> None:
+    """A target that is no longer in the queue has no gap left to splice into."""
+    tracks = [_track(index) for index in range(3)]
+    dummy = _make_replan_dj(tmp_path, list(tracks))
+    state = dummy._dj_queues["queue-1"]
+    items = list(dummy.player_queues.items("queue-1"))
+    before = list(items)
+
+    outcome = _splice_gap(dummy, items, "vanished-item")
+
+    assert outcome == "gap_gone"
+    assert items == before
+    assert state.clip_counter == 0
+
+
+def test_outro_too_close_at_the_guard_lands_nothing(tmp_path: Path) -> None:
+    """An outro whose insertion point is the guard slot itself is not spliced."""
+    tracks = [_track(index) for index in range(3)]
+    dummy = _make_replan_dj(tmp_path, list(tracks))
+    state = dummy._dj_queues["queue-1"]
+    items = list(dummy.player_queues.items("queue-1"))
+    before = list(items)
+
+    outcome = _splice_gap(dummy, items, tracks[0].queue_item_id, guard_index=0, after_target=True)
+
+    assert outcome == "too_close"
+    assert items == before
+    assert state.clip_counter == 0
+
+
+def test_the_clip_shares_its_targets_sort_index(tmp_path: Path) -> None:
+    """A clip takes its target's sort index, so un-shuffling keeps the two together."""
+    tracks = [_track(index) for index in range(3)]
+    dummy = _make_replan_dj(tmp_path, list(tracks))
+    items = list(dummy.player_queues.items("queue-1"))
+
+    outcome = _splice_gap(dummy, items, tracks[1].queue_item_id)
+
+    assert outcome == "injected"
+    clip = items[1]
+    assert clip.queue_item_id != tracks[1].queue_item_id
+    assert clip.sort_index == tracks[1].sort_index
+
+
 def _outro_host() -> dict[str, Any]:
     """Return a host that always plans a section at the end of the playlist."""
     host = _must_host()
@@ -894,6 +1761,94 @@ async def test_replan_plans_an_outro_at_the_queue_tail(tmp_path: Path) -> None:
     final_items = dummy.player_queues.items("queue-1")
     assert final_items[-1].extra_attributes[ATTR_QUEUE_DJ] is True
     assert final_items[-1].extra_attributes.get(ATTR_GAP_NEXT_ID) is None
+
+
+def _show_host() -> dict[str, Any]:
+    """Return a host that speaks between songs and once more at the end of the queue."""
+    host = _must_host()
+    host["section_order"] = [
+        {"when": "between_songs", "flow": [{"MUST": "Song_Transition"}]},
+        {"when": "end_of_playlist", "flow": [{"MUST": "Song_Transition"}]},
+    ]
+    return host
+
+
+async def test_a_host_that_switches_its_outro_off_plans_none(tmp_path: Path) -> None:
+    """The outro is the host's call, so a switched-off host earns no outro at the queue end."""
+    host = _show_host()
+    host["play_outro"] = False
+    dummy = _make_replan_dj(
+        tmp_path,
+        [_track(index) for index in range(3)],
+        current_index=-1,
+        index_in_buffer=-1,
+        host=host,
+    )
+    dummy._dj_queues["queue-1"].station_id = "station_a"
+
+    await dummy._replan_queue("queue-1")
+
+    assert _outro_clips(dummy) == []
+    # the between-songs breaks still plan, so the pass is not simply idle
+    assert dummy.player_queues.loads
+
+
+async def test_a_host_that_keeps_its_outro_on_plans_one(tmp_path: Path) -> None:
+    """With the switch left on, the show keeps its outro exactly as before."""
+    dummy = _make_replan_dj(
+        tmp_path,
+        [_track(index) for index in range(3)],
+        current_index=-1,
+        index_in_buffer=-1,
+        host=_show_host(),
+    )
+    dummy._dj_queues["queue-1"].station_id = "station_a"
+
+    await dummy._replan_queue("queue-1")
+
+    outros = _outro_clips(dummy)
+    assert len(outros) == 1
+    assert outros[0].extra_attributes.get(ATTR_GAP_NEXT_ID) is None
+
+
+async def test_the_outro_switch_off_keeps_the_outro_off_the_bus(tmp_path: Path) -> None:
+    """A term path obeys the same switch: no outro term is decided for a host without one."""
+    host = _show_host()
+    host["play_outro"] = False
+    tracks = [_track(index) for index in range(4)]
+    for track in tracks:
+        track.duration = TRACK_SECONDS
+    dummy = _make_replan_dj(tmp_path, tracks, host=host)
+    dummy.mass.activate_program_bus("queue-1")
+    dummy._dj_queues["queue-1"].station_id = "station_a"
+    dummy.player_queues._queue.current_item = tracks[0]
+    dummy.player_queues._queue.corrected_elapsed_time = POSITION_SECONDS
+
+    await dummy._replan_queue("queue-1")
+
+    assert [term for term in _terms(dummy) if term.successor_id is None] == []
+    # the between-songs boundaries are still decided, so only the outro was dropped
+    assert _terms(dummy)
+
+
+async def test_replan_writes_no_break_around_a_track_that_cannot_play(tmp_path: Path) -> None:
+    """A track that can not play earns no break before or after it, so none is paid for."""
+    tracks = [_track(index) for index in range(5)]
+    tracks[2].available = False
+    dummy = _make_replan_dj(tmp_path, list(tracks))
+
+    await dummy._replan_queue("queue-1")
+
+    final_items = dummy.player_queues.items("queue-1")
+    announced = {
+        item.extra_attributes.get(ATTR_GAP_NEXT_ID)
+        for item in final_items
+        if item.extra_attributes.get(ATTR_QUEUE_DJ)
+    }
+    assert tracks[2].queue_item_id not in announced
+    assert tracks[3].queue_item_id not in announced
+    # the gap further down still gets its break, so an idle planner cannot make this pass
+    assert tracks[4].queue_item_id in announced
 
 
 async def test_show_bound_two_track_show_gets_exactly_one_outro(tmp_path: Path) -> None:
@@ -965,6 +1920,24 @@ async def test_no_second_outro_behind_user_appended_tracks(tmp_path: Path) -> No
     assert len(dj_clips) == 1
 
 
+async def test_an_outro_spends_no_decided_gap(tmp_path: Path) -> None:
+    """An outro announces no successor track, so it neither takes nor reopens a decided gap."""
+    tracks = [_track(0), _track(1)]
+    dummy = _make_replan_dj(
+        tmp_path, list(tracks), current_index=-1, index_in_buffer=-1, host=_outro_host()
+    )
+    state = dummy._dj_queues["queue-1"]
+    state.station_id = "station_a"
+    state.decided_gap_ids = {tracks[1].queue_item_id}
+
+    await dummy._replan_queue("queue-1")
+
+    outros = _outro_clips(dummy)
+    assert len(outros) == 1
+    assert outros[0].extra_attributes.get(ATTR_GAP_NEXT_ID) is None
+    assert state.decided_gap_ids == {tracks[1].queue_item_id}
+
+
 @pytest.mark.usefixtures("kitchen_only_user")
 async def test_set_queue_dj_refuses_a_queue_the_user_has_no_access_to(tmp_path: Path) -> None:
     """A member restricted to some players can not arm or clear the DJ of another queue."""
@@ -986,7 +1959,7 @@ async def test_status_only_shows_the_queues_the_user_has_access_to(tmp_path: Pat
     dummy = DummyQueueDJ(tmp_path)
     dummy._arm_dj_state("living_room", "rick")
 
-    expected = {"kitchen": {"host_id": "rick", "station_id": ""}}
+    expected = {"kitchen": _status_entry("rick")}
     assert await dummy.set_queue_dj("kitchen", "rick") == expected
     assert await dummy.get_queue_dj_status() == expected
     assert set(dummy._dj_queues) == {"kitchen", "living_room"}
@@ -1501,6 +2474,23 @@ async def test_hourly_host_speaks_again_after_a_clear_and_refill(tmp_path: Path)
     assert new_loads[0][0][0].extra_attributes[ATTR_GAP_NEXT_ID] == fresh[2].queue_item_id
 
 
+async def test_max_per_60min_holds_within_one_queue(tmp_path: Path) -> None:
+    """A once-per-hour guard allows one break in the hour, leaving the later gaps empty."""
+    tracks = [_track(index) for index in range(6)]
+    dummy = _make_replan_dj(tmp_path, list(tracks), host=_hourly_host())
+    for section in _hourly_sections():
+        dummy._sections[section["id"]] = section
+
+    await dummy._replan_queue("queue-1")
+
+    # the first gap airs the weather and news, the four behind it stay empty this hour
+    assert len(dummy.player_queues.loads) == 1
+    assert _announced_gaps(dummy) == {tracks[2].queue_item_id}
+    assert dummy._dj_queues["queue-1"].decided_gap_ids == {
+        track.queue_item_id for track in tracks[2:]
+    }
+
+
 async def test_replacing_the_upcoming_tracks_reanchors_the_guard(tmp_path: Path) -> None:
     """Swapping every upcoming track leaves the DJ speaking at its normal gap, not silent."""
     tracks_v1 = [_track(index) for index in range(6)]
@@ -1837,6 +2827,36 @@ async def test_a_vanished_target_leaves_its_gap_open(tmp_path: Path) -> None:
     assert tracks[3].queue_item_id in state.decided_gap_ids
 
 
+async def test_decided_gaps_are_forgotten_when_their_track_leaves_the_queue(
+    tmp_path: Path,
+) -> None:
+    """A track leaving the queue drops its decision, so a later return is planned afresh."""
+    tracks = [_track(index) for index in range(4)]
+    dummy = _make_replan_dj(tmp_path, list(tracks))
+    queues = dummy.player_queues
+    await dummy._replan_queue("queue-1")
+    state = dummy._dj_queues["queue-1"]
+    assert state.decided_gap_ids == {tracks[2].queue_item_id, tracks[3].queue_item_id}
+
+    # the user removes the last track together with the clip that announced it
+    queues._items = [
+        item
+        for item in queues.items("queue-1")
+        if item is not tracks[3]
+        and item.extra_attributes.get(ATTR_GAP_NEXT_ID) != tracks[3].queue_item_id
+    ]
+    await dummy._replan_queue("queue-1")
+
+    assert state.decided_gap_ids == {tracks[2].queue_item_id}
+
+    # the track comes back, as a reorder or a re-add rebuilds the queue
+    queues._items.append(tracks[3])
+    await dummy._replan_queue("queue-1")
+
+    assert queues.loads[-1][0][0].extra_attributes[ATTR_GAP_NEXT_ID] == tracks[3].queue_item_id
+    assert state.decided_gap_ids == {tracks[2].queue_item_id, tracks[3].queue_item_id}
+
+
 async def test_reordering_the_queue_keeps_the_moved_gaps_plannable(tmp_path: Path) -> None:
     """Shuffling new tracks into the upcoming items must not hide the moved gaps for good."""
     tracks = [_track(index) for index in range(4)]
@@ -1914,12 +2934,12 @@ async def test_replan_injects_nothing_while_the_dj_is_paused(tmp_path: Path) -> 
     dummy = _make_replan_dj(tmp_path, [_track(index) for index in range(4)])
     state = dummy._dj_queues["queue-1"]
     loop = asyncio.get_running_loop()
-    state.render_health.cooldown_until = loop.time() + 100
+    state.render_health.tts.cooldown_until = loop.time() + 100
 
     await dummy._replan_queue("queue-1")
     assert dummy.player_queues.loads == []
 
-    state.render_health.cooldown_until = loop.time() - 1
+    state.render_health.tts.cooldown_until = loop.time() - 1
     await dummy._replan_queue("queue-1")
     assert len(dummy.player_queues.loads) == 2
 
@@ -1939,7 +2959,7 @@ async def test_pausing_the_dj_drops_its_pending_clips_and_books_a_replan(tmp_pat
     await dummy._replan_queue("queue-1")
     state = dummy._dj_queues["queue-1"]
 
-    dummy._pause_queue_dj("queue-1", loading.queue_item_id)
+    dummy._pause_queue_dj("queue-1", loading.queue_item_id, TTS_COOLDOWN_SECONDS)
 
     assert queues.deleted == [clip.queue_item_id for clip in pending]
     assert queues._items[2] is loading
@@ -1948,7 +2968,7 @@ async def test_pausing_the_dj_drops_its_pending_clips_and_books_a_replan(tmp_pat
     assert state.history["Song_Transition"] == []
     assert dummy.mass.timers == [
         (
-            RENDER_COOLDOWN_SECONDS,
+            TTS_COOLDOWN_SECONDS,
             dummy._schedule_replan,
             ("queue-1",),
             "ai_radio_dj_cooldown_queue-1",
@@ -1972,7 +2992,7 @@ async def test_pausing_keeps_a_failed_clip_that_sits_past_the_guard_slot(tmp_pat
     await dummy._replan_queue("queue-1")
     state = dummy._dj_queues["queue-1"]
 
-    dummy._pause_queue_dj("queue-1", failed.queue_item_id)
+    dummy._pause_queue_dj("queue-1", failed.queue_item_id, TTS_COOLDOWN_SECONDS)
 
     assert queues.deleted == [clip.queue_item_id for clip in pending]
     assert failed in queues._items
@@ -1997,7 +3017,7 @@ async def test_pausing_forgets_the_failed_breaks_history_without_later_clips(
     queues._queue.current_index = queues._items.index(failed) - 1
     queues._queue.index_in_buffer = queues._queue.current_index
 
-    dummy._pause_queue_dj("queue-1", failed.queue_item_id)
+    dummy._pause_queue_dj("queue-1", failed.queue_item_id, TTS_COOLDOWN_SECONDS)
 
     assert queues.deleted == []
     assert failed_song not in [song for song, _minute in state.history["Song_Transition"]]
@@ -2010,7 +3030,7 @@ async def test_a_pass_in_flight_when_the_pause_starts_injects_nothing(tmp_path: 
     prepare_tokens = dummy._prepare_runtime_tokens
 
     async def _pause_mid_pass(program: dict[str, Any]) -> dict[str, str]:
-        state.render_health.cooldown_until = asyncio.get_running_loop().time() + 100
+        state.render_health.tts.cooldown_until = asyncio.get_running_loop().time() + 100
         return await prepare_tokens(program)
 
     dummy._prepare_runtime_tokens = _pause_mid_pass  # type: ignore[method-assign]
@@ -2112,8 +3132,1131 @@ async def test_player_removed_emits_a_queue_dj_hint(tmp_path: Path) -> None:
     await dummy._on_dj_queue_event(_player_removed("queue-1"))
 
     assert "queue-1" not in dummy._dj_queues
+    # the queue's claim on mixed boundaries is released with its DJ state
+    assert dummy.mass.boundary_mix_calls == [("queue-1", False)]
     assert dummy.provider_events == [{"event": EVENT_QUEUE_DJ_UPDATED}]
 
     fresh = DummyQueueDJ(tmp_path)
     await fresh._load_queue_dj()
     assert "queue-1" not in fresh._dj_queues
+
+
+async def test_a_replan_that_finds_its_host_gone_releases_the_boundary_claim(
+    tmp_path: Path,
+) -> None:
+    """A host deleted while its state is armed drops the state and its claim."""
+    dj = _dj_harness(tmp_path)
+    _fake_queue_with_sources(dj, "q1", [])
+    dj.mass.player_queues._items = [_track(1), _track(2)]
+    state = dj._arm_dj_state("q1", "amy")
+    state.ready = True
+    del dj._hosts["amy"]
+
+    await dj._replan_queue("q1")
+
+    assert "q1" not in dj._dj_queues
+    assert dj.mass.boundary_mix_calls[-1] == ("q1", False)
+
+
+def test_a_section_edit_rearms_the_boundary_claim(tmp_path: Path) -> None:
+    """A section that opts into pre or post flips the claim of the queues its host armed."""
+    dj = _dj_harness(tmp_path)
+    dj._sections["talk"] = {"id": "talk"}
+    dj._hosts["amy"]["section_ids"] = ["talk"]
+    dj._arm_dj_state("q1", "amy")
+
+    dj._refresh_stream_claims()
+    assert dj.mass.boundary_mix_calls[-1] == ("q1", False)
+    assert dj.mass.lead_hold_calls[-1] == ("q1", False)
+
+    dj._sections["talk"]["allow_pre"] = True
+    dj._refresh_stream_claims()
+    assert dj.mass.boundary_mix_calls[-1] == ("q1", True)
+    # only a pre lets a break start over the outgoing tail, so only it holds the tails
+    assert dj.mass.lead_hold_calls[-1] == ("q1", True)
+
+    dj._sections["talk"]["allow_pre"] = False
+    dj._sections["talk"]["allow_post"] = True
+    dj._refresh_stream_claims()
+    assert dj.mass.boundary_mix_calls[-1] == ("q1", True)
+    assert dj.mass.lead_hold_calls[-1] == ("q1", False)
+
+
+def _terms(dummy: ReplanQueueDJ) -> list[ProgramTerm]:
+    """Return the terms the queue's DJ holds for the boundaries of its last pass."""
+    return list(dummy._term_store("queue-1").terms())
+
+
+async def _due_term(
+    dummy: ReplanQueueDJ, tracks: list[FakeQueueItem], index: int, seconds_left: float
+) -> None:
+    """Let the player run into the end of the given track, where its term is due."""
+    queue = dummy.player_queues._queue
+    queue.current_item = tracks[index]
+    queue.corrected_elapsed_time = TRACK_SECONDS - seconds_left
+    await dummy._pump_terms("queue-1")
+
+
+async def _drain_tasks(mass: FakeMass, waves: int = 20) -> None:
+    """Run every task the harness started, including the ones those tasks start."""
+    for _ in range(waves):
+        pending = [task for task in mass.tasks if not task.done()]
+        if not pending:
+            return
+        await asyncio.gather(*pending)
+
+
+def _intro_host(host_id: str = "rick") -> dict[str, Any]:
+    """Return a host that speaks a section at the start of the playlist."""
+    host = _must_host()
+    host["id"] = host_id
+    host["name"] = host_id.title()
+    host["section_order"] = [
+        {"when": "start_of_playlist", "flow": [{"MUST": "Song_Transition"}]},
+        {"when": "between_songs", "flow": [{"MUST": "Song_Transition"}]},
+    ]
+    return host
+
+
+def _intro_pending(dummy: ReplanQueueDJ) -> bool:
+    """Return whether the DJ owes its queue an intro it could not speak yet."""
+    state: DJQueueState = dummy._dj_queues["queue-1"]
+    return state.intro_pending
+
+
+def _armed_intro_dj(tmp_path: Path, host: dict[str, Any] | None = None) -> ReplanQueueDJ:
+    """Build an armed DJ on a queue that mixes programs, with an intro-speaking host."""
+    dummy = _make_replan_dj(
+        tmp_path, [_track(index) for index in range(4)], host=host or _intro_host()
+    )
+    dummy.mass.activate_program_bus("queue-1")
+    return dummy
+
+
+def _overlay_dj(
+    tmp_path: Path, host: dict[str, Any] | None = None
+) -> tuple[ReplanQueueDJ, list[FakeQueueItem]]:
+    """Build an armed DJ on a playing, program-mixing queue at a known position."""
+    tracks = [_track(index) for index in range(4)]
+    for track in tracks:
+        track.duration = TRACK_SECONDS
+    dummy = _make_replan_dj(tmp_path, tracks, host=host or _must_host())
+    dummy.mass.activate_program_bus("queue-1")
+    queue = dummy.player_queues._queue
+    queue.current_item = tracks[0]
+    queue.corrected_elapsed_time = POSITION_SECONDS
+    return dummy, tracks
+
+
+async def _replan_with_the_guard_moved(dummy: ReplanQueueDJ, guard_index: int) -> None:
+    """Advance the player's buffer mid-pass, so planned gaps fall behind the guard."""
+    prepare = dummy._prepare_runtime_tokens
+
+    async def _slow_prepare(program: dict[str, Any]) -> dict[str, str]:
+        # stands in for a slow token source: the player buffers ahead while we wait
+        dummy.player_queues._queue.index_in_buffer = guard_index
+        return await prepare(program)
+
+    dummy._prepare_runtime_tokens = _slow_prepare  # type: ignore[method-assign]
+    try:
+        await dummy._replan_queue("queue-1")
+    finally:
+        dummy._prepare_runtime_tokens = prepare  # type: ignore[method-assign]
+
+
+def _announced_gaps(dummy: ReplanQueueDJ) -> set[Any]:
+    """Return the tracks the clips of the last pass were spliced in front of."""
+    return {
+        items[0].extra_attributes[ATTR_GAP_NEXT_ID] for items, _index in dummy.player_queues.loads
+    }
+
+
+def _outro_clips(dummy: ReplanQueueDJ) -> list[Any]:
+    """Return the DJ clips that announce no following track, i.e. a show's outro."""
+    return [
+        item
+        for item in dummy.player_queues.items("queue-1")
+        if item.extra_attributes.get(ATTR_QUEUE_DJ)
+        and item.extra_attributes.get(ATTR_GAP_NEXT_ID) is None
+    ]
+
+
+async def test_activating_the_dj_mixes_the_hosts_intro_over_the_stream(tmp_path: Path) -> None:
+    """Switching a DJ on speaks its start-of-playlist section as a single overlay."""
+    dummy = _armed_intro_dj(tmp_path)
+
+    await dummy.set_queue_dj("queue-1", "rick")
+    await _drain_tasks(dummy.mass)
+
+    assert len(dummy.mass.overlays) == 1
+    queue_id, pcm, label, start_in_seconds = dummy.mass.overlays[0]
+    assert queue_id == "queue-1"
+    assert label == OVERLAY_LABEL_INTRO
+    # the intro is due right away, not at a boundary further ahead
+    assert start_in_seconds == 0.0
+    # it is an intro, so the stream's buffer depth never drops it as late
+    assert dummy.mass.overlay_kinds == [ProgramKind.INTRO]
+    # it is the intro section, voiced by the host that was switched on
+    assert dummy.rendered == [("rick", "Song_Transition")]
+    assert pcm
+
+
+async def test_a_later_replan_keeps_the_intro_to_its_one_airing(tmp_path: Path) -> None:
+    """A replan after the intro aired does not speak it a second time."""
+    dummy = _armed_intro_dj(tmp_path)
+    await dummy.set_queue_dj("queue-1", "rick")
+    await _drain_tasks(dummy.mass)
+
+    dummy._schedule_replan("queue-1")
+    await _drain_tasks(dummy.mass)
+
+    assert len(dummy.mass.overlays) == 1
+
+
+async def test_the_intro_stays_out_when_the_setting_is_off(tmp_path: Path) -> None:
+    """With the intro switched off nothing is rendered and nothing is mixed in."""
+    dummy = _armed_intro_dj(tmp_path)
+    dummy.config_values[CONF_PLAY_INTRO_ON_ACTIVATE] = False
+
+    await dummy.set_queue_dj("queue-1", "rick")
+    await _drain_tasks(dummy.mass)
+
+    assert dummy.mass.overlays == []
+    assert dummy.rendered == []
+
+
+async def test_an_intro_without_a_live_flow_stream_is_left_out(tmp_path: Path) -> None:
+    """A queue that is not streaming has no intro mixed into anything, and no error either."""
+    dummy = _make_replan_dj(tmp_path, [_track(index) for index in range(4)], host=_intro_host())
+
+    await dummy.set_queue_dj("queue-1", "rick")
+    await _drain_tasks(dummy.mass)
+
+    assert dummy.mass.overlays == []
+    # the breaks are still planned as queue items, so nothing else was held up
+    assert dummy.player_queues.loads
+
+
+async def test_a_paused_queue_is_not_spoken_an_intro(tmp_path: Path) -> None:
+    """An intro is not mixed into a queue that plays nothing right now."""
+    dummy = _armed_intro_dj(tmp_path)
+    dummy.player_queues._queue.state = PlaybackState.PAUSED
+
+    await dummy.set_queue_dj("queue-1", "rick")
+    await _drain_tasks(dummy.mass)
+
+    assert dummy.mass.overlays == []
+
+
+async def test_a_host_without_an_intro_section_is_not_spoken(tmp_path: Path) -> None:
+    """A host that only speaks between songs gets no intro overlay."""
+    dummy = _armed_intro_dj(tmp_path, host=_must_host())
+
+    await dummy.set_queue_dj("queue-1", "rick")
+    await _drain_tasks(dummy.mass)
+
+    assert dummy.mass.overlays == []
+
+
+async def test_a_failed_intro_render_is_logged_and_planning_resumes(tmp_path: Path) -> None:
+    """An engine that fails the intro leaves no overlay behind and does not block the breaks."""
+    dummy = _armed_intro_dj(tmp_path)
+    dummy.fail_overlay_render = True
+
+    await dummy.set_queue_dj("queue-1", "rick")
+    await _drain_tasks(dummy.mass)
+
+    assert dummy.mass.overlays == []
+    assert dummy._dj_queues["queue-1"].intro_until is None
+    # the boundaries are decided once the failed intro is out of the way, none as an item
+    assert dummy.player_queues.loads == []
+    assert _terms(dummy)
+
+
+async def test_planning_holds_while_the_intro_renders(tmp_path: Path) -> None:
+    """No break is planned while the intro is still being rendered."""
+    dummy = _armed_intro_dj(tmp_path)
+    state = dummy._dj_queues["queue-1"]
+    state.intro_until = asyncio.get_running_loop().time() + INTRO_RENDER_TIMEOUT_SECONDS
+
+    await dummy._replan_queue("queue-1")
+
+    assert dummy.player_queues.loads == []
+    assert state.decided_gap_ids == set()
+
+
+async def test_a_hanging_intro_render_stops_holding_planning_at_the_deadline(
+    tmp_path: Path,
+) -> None:
+    """An intro that never finishes holds the planner only until its cap, then lets it go."""
+    dummy = _armed_intro_dj(tmp_path)
+    state = dummy._dj_queues["queue-1"]
+    state.intro_until = asyncio.get_running_loop().time() - 1
+
+    await dummy._replan_queue("queue-1")
+
+    assert state.intro_until is None
+    assert dummy.player_queues.loads == []
+    assert _terms(dummy)
+
+
+async def test_reactivating_the_dj_speaks_the_intro_again(tmp_path: Path) -> None:
+    """Switching the DJ off and on again speaks a fresh intro for the new session."""
+    dummy = _armed_intro_dj(tmp_path)
+
+    await dummy.set_queue_dj("queue-1", "rick")
+    await _drain_tasks(dummy.mass)
+    await dummy.set_queue_dj("queue-1", None)
+    await _drain_tasks(dummy.mass)
+    await dummy.set_queue_dj("queue-1", "rick")
+    await _drain_tasks(dummy.mass)
+
+    assert len(dummy.mass.overlays) == 2
+
+
+async def test_a_show_start_speaks_the_hosts_intro_exactly_once(tmp_path: Path) -> None:
+    """A show arming its host speaks one intro, not one per arming path."""
+    dummy = ReplanQueueDJ(
+        tmp_path,
+        FakeQueue("queue-1", 0, 0),
+        [_track(index) for index in range(4)],
+        _intro_host("amy"),
+    )
+    dummy._stations["morning_show"] = {"id": "morning_show", "host_id": "amy"}
+    _fake_queue_with_sources(dummy, "queue-1", [f"{dummy.instance_id}://radio/morning_show"])
+    dummy.mass.activate_program_bus("queue-1")
+
+    await dummy._ensure_show_dj("queue-1")
+    await _drain_tasks(dummy.mass)
+
+    assert len(dummy.mass.overlays) == 1
+    assert dummy.mass.overlays[0][2] == OVERLAY_LABEL_INTRO
+
+
+async def test_a_show_that_arms_while_its_queue_loads_speaks_the_intro_once_it_plays(
+    tmp_path: Path,
+) -> None:
+    """A show arm precedes playback, so its intro is owed until the stream can air it."""
+    dummy = ReplanQueueDJ(
+        tmp_path,
+        FakeQueue("queue-1", 0, 0),
+        [_track(index) for index in range(4)],
+        _intro_host("amy"),
+    )
+    dummy._stations["morning_show"] = {"id": "morning_show", "host_id": "amy"}
+    _fake_queue_with_sources(dummy, "queue-1", [f"{dummy.instance_id}://radio/morning_show"])
+    # the switch is on, but the queue is still loading and no flow session exists yet
+    dummy.mass.streams.program_bus_enabled_flag = True
+    dummy.player_queues._queue.state = PlaybackState.IDLE
+
+    await dummy._ensure_show_dj("queue-1")
+    await _drain_tasks(dummy.mass)
+
+    assert dummy.mass.overlays == []
+    assert _intro_pending(dummy)
+
+    # the queue starts playing and its stream publishes a bus
+    dummy.mass.activate_program_bus("queue-1")
+    dummy.player_queues._queue.state = PlaybackState.PLAYING
+    await dummy._replan_queue("queue-1")
+    await _drain_tasks(dummy.mass)
+
+    assert len(dummy.mass.overlays) == 1
+    assert dummy.mass.overlays[0][2] == OVERLAY_LABEL_INTRO
+    assert not _intro_pending(dummy)
+
+    # a later pass owes nothing
+    await dummy._replan_queue("queue-1")
+    await _drain_tasks(dummy.mass)
+    assert len(dummy.mass.overlays) == 1
+
+
+async def test_a_dj_switched_on_before_its_queue_plays_speaks_the_intro_later(
+    tmp_path: Path,
+) -> None:
+    """Switching a DJ on at an idle queue speaks its intro when playback starts."""
+    dummy = _make_replan_dj(tmp_path, [_track(index) for index in range(4)], host=_intro_host())
+    # the switch is on; the queue plays nothing yet and has no flow session of its own
+    dummy.mass.streams.program_bus_enabled_flag = True
+    dummy.player_queues._queue.state = PlaybackState.IDLE
+
+    await dummy.set_queue_dj("queue-1", "rick")
+    await _drain_tasks(dummy.mass)
+
+    assert dummy.mass.overlays == []
+    assert _intro_pending(dummy)
+
+    dummy.mass.activate_program_bus("queue-1")
+    dummy.player_queues._queue.state = PlaybackState.PLAYING
+    await dummy._replan_queue("queue-1")
+    await _drain_tasks(dummy.mass)
+
+    assert len(dummy.mass.overlays) == 1
+    assert dummy.mass.overlays[0][2] == OVERLAY_LABEL_INTRO
+
+
+async def test_an_owed_intro_is_looked_for_again_when_the_stream_opens_late(
+    tmp_path: Path,
+) -> None:
+    """A playing queue whose bus opens after the switch still hears its intro."""
+    dummy = _make_replan_dj(tmp_path, [_track(index) for index in range(4)], host=_intro_host())
+    # the switch is on, but the queue's flow session has not opened a bus yet
+    dummy.mass.streams.program_bus_enabled_flag = True
+
+    await dummy.set_queue_dj("queue-1", "rick")
+    await _drain_tasks(dummy.mass)
+
+    assert dummy.mass.overlays == []
+    assert _intro_pending(dummy)
+    retry = next(timer for timer in dummy.mass.timers if timer[3] == "ai_radio_intro_retry_queue-1")
+
+    dummy.mass.activate_program_bus("queue-1")
+    retry[1](*retry[2])
+    await _drain_tasks(dummy.mass)
+
+    assert len(dummy.mass.overlays) == 1
+    assert dummy.mass.overlays[0][2] == OVERLAY_LABEL_INTRO
+
+
+async def test_a_dj_that_is_switched_off_again_owes_no_intro(tmp_path: Path) -> None:
+    """A DJ disabled before its queue plays speaks nothing once playback starts."""
+    dummy = _make_replan_dj(tmp_path, [_track(index) for index in range(4)], host=_intro_host())
+    dummy.player_queues._queue.state = PlaybackState.IDLE
+    await dummy.set_queue_dj("queue-1", "rick")
+    await _drain_tasks(dummy.mass)
+
+    await dummy.set_queue_dj("queue-1", None)
+    dummy.mass.activate_program_bus("queue-1")
+    dummy.player_queues._queue.state = PlaybackState.PLAYING
+    await dummy._replan_queue("queue-1")
+    await _drain_tasks(dummy.mass)
+
+    assert dummy.mass.overlays == []
+
+
+async def test_a_restored_dj_owes_no_intro(tmp_path: Path) -> None:
+    """A DJ restored from the cache sets no owed intro, so it stays silent once it plays."""
+    first = _armed_intro_dj(tmp_path)
+    await first.set_queue_dj("queue-1", "rick")
+    await _drain_tasks(first.mass)
+
+    restored = _armed_intro_dj(tmp_path)
+    await restored._load_queue_dj()
+    await restored._replan_queue("queue-1")
+    await _drain_tasks(restored.mass)
+
+    assert not _intro_pending(restored)
+    assert restored.mass.overlays == []
+
+
+async def test_a_dj_restored_from_the_cache_speaks_no_intro(tmp_path: Path) -> None:
+    """A DJ that comes back from the cache after a restart stays silent until it is switched on."""
+    first = _armed_intro_dj(tmp_path)
+    await first.set_queue_dj("queue-1", "rick")
+    await _drain_tasks(first.mass)
+    assert len(first.mass.overlays) == 1
+
+    restored = _armed_intro_dj(tmp_path)
+    await restored._load_queue_dj()
+
+    assert restored._dj_queues["queue-1"].host_id == "rick"
+    assert restored.mass.overlays == []
+    assert restored.rendered == []
+
+
+async def test_a_host_switch_speaks_the_new_hosts_intro_once(tmp_path: Path) -> None:
+    """Switching the host mid-queue speaks the new host's intro, and only that one."""
+    dummy = _armed_intro_dj(tmp_path)
+    dummy._hosts["amy"] = _intro_host("amy")
+    await dummy.set_queue_dj("queue-1", "rick")
+    await _drain_tasks(dummy.mass)
+
+    await dummy.set_queue_dj("queue-1", "amy")
+    await _drain_tasks(dummy.mass)
+
+    assert len(dummy.mass.overlays) == 2
+    assert [host_id for host_id, _section in dummy.rendered] == ["rick", "amy"]
+
+
+async def test_a_bus_that_disappeared_before_the_intro_renders_is_survived(
+    tmp_path: Path,
+) -> None:
+    """A flow session that ended while the intro rendered is not an error."""
+    dummy = _armed_intro_dj(tmp_path)
+    await dummy.set_queue_dj("queue-1", "rick")
+    dummy.mass.drop_program_bus("queue-1")
+
+    await _drain_tasks(dummy.mass)
+
+    assert dummy.mass.overlays == []
+    assert dummy._dj_queues["queue-1"].intro_until is None
+
+
+async def test_the_intro_stays_out_with_the_program_bus_switched_off(tmp_path: Path) -> None:
+    """The experimental program bus switch is the kill switch for the intro too."""
+    dummy = _armed_intro_dj(tmp_path)
+    dummy.mass.streams.program_bus_enabled_flag = False
+
+    await dummy.set_queue_dj("queue-1", "rick")
+    await _drain_tasks(dummy.mass)
+
+    assert dummy.mass.overlays == []
+
+
+async def test_a_host_that_keeps_its_intro_on_speaks_it(tmp_path: Path) -> None:
+    """A host that leaves its switch on speaks its intro exactly as before."""
+    host = _intro_host()
+    host["play_intro"] = True
+    dummy = _armed_intro_dj(tmp_path, host=host)
+
+    await dummy.set_queue_dj("queue-1", "rick")
+    await _drain_tasks(dummy.mass)
+
+    assert [label for _qid, _pcm, label, _start in dummy.mass.overlays] == [OVERLAY_LABEL_INTRO]
+    assert dummy.rendered == [("rick", "Song_Transition")]
+
+
+async def test_a_host_that_switches_its_intro_off_speaks_none(tmp_path: Path) -> None:
+    """The host's own switch decides, even for a host that plans a start-of-playlist section."""
+    host = _intro_host()
+    host["play_intro"] = False
+    dummy = _armed_intro_dj(tmp_path, host=host)
+
+    await dummy.set_queue_dj("queue-1", "rick")
+    await _drain_tasks(dummy.mass)
+
+    assert dummy.mass.overlays == []
+    assert dummy.rendered == []
+    # nothing is owed either, so no lookup is booked for a later stream
+    assert not _intro_pending(dummy)
+
+
+async def test_a_host_that_switches_its_intro_off_books_no_lookups(tmp_path: Path) -> None:
+    """A switched-off intro is not looked for again when the stream opens late."""
+    host = _intro_host()
+    host["play_intro"] = False
+    dummy = _armed_intro_dj(tmp_path, host=host)
+    dummy.mass.drop_program_bus("queue-1")
+
+    await dummy.set_queue_dj("queue-1", "rick")
+    await _drain_tasks(dummy.mass)
+
+    assert not _intro_pending(dummy)
+    # no intro lookup is booked for a later stream, whatever else the DJ scheduled
+    assert not [
+        timer for timer in dummy.mass.timers if (timer[3] or "").startswith("ai_radio_intro")
+    ]
+
+
+async def test_the_provider_switch_off_wins_over_a_host_that_wants_its_intro(
+    tmp_path: Path,
+) -> None:
+    """The global switch is the stricter side, so it keeps a host's intro switched off."""
+    dummy = _armed_intro_dj(tmp_path)  # the host leaves its switch on
+    dummy.config_values[CONF_PLAY_INTRO_ON_ACTIVATE] = False
+
+    await dummy.set_queue_dj("queue-1", "rick")
+    await _drain_tasks(dummy.mass)
+
+    assert dummy.mass.overlays == []
+    assert dummy.rendered == []
+
+
+async def test_a_boundary_the_player_already_holds_is_a_term_not_an_item(
+    tmp_path: Path,
+) -> None:
+    """Every boundary is spoken over the stream; the queue never gains an item for it."""
+    dummy, tracks = _overlay_dj(tmp_path)
+    dummy._sections["Song_Transition"]["allow_post"] = True
+
+    await _replan_with_the_guard_moved(dummy, 1)
+
+    assert dummy.player_queues.loads == []
+    # the pass serves the boundary the running item ends at along with the ones ahead
+    assert len(_terms(dummy)) == 3
+
+    # once that item plays and its end comes close, its term is placed on the boundary
+    await _due_term(dummy, tracks, 1, 8.0)
+
+    assert len(dummy.mass.overlays) == 1
+    queue_id, pcm, label, delay = dummy.mass.overlays[0]
+    assert queue_id == "queue-1"
+    assert label == OVERLAY_LABEL_TRANSITION
+    assert pcm
+    # the running item has this much left, so the break starts on its boundary; the bus
+    # measures the delay from what the listener hears
+    assert delay == pytest.approx(8.0 - TERM_START_BIAS_SECONDS)
+    # the boundary the placed term speaks is decided in the store, not in the item path's set
+    store = dummy._term_store("queue-1")
+    assert store.state((tracks[1].queue_item_id, tracks[2].queue_item_id)) is (
+        BoundaryState.DECIDED
+    )
+
+
+async def test_a_term_without_a_playhead_is_dropped(tmp_path: Path) -> None:
+    """Without a position there is no boundary to aim at, so nothing is mixed in."""
+    dummy, _tracks = _overlay_dj(tmp_path)
+    dummy.player_queues._queue.current_item = None
+
+    await _replan_with_the_guard_moved(dummy, 1)
+    await _drain_tasks(dummy.mass)
+
+    assert dummy.mass.overlays == []
+    assert dummy.player_queues.loads == []
+    assert all(term.is_terminal for term in _terms(dummy))
+
+
+async def test_a_cut_short_head_leaves_no_term_to_place(tmp_path: Path) -> None:
+    """A break whose head no longer fits has no start left, so it is dropped, never placed."""
+    host = _must_host()
+    host["term_head_seconds"] = 12.0
+    dummy, tracks = _overlay_dj(tmp_path, host=host)
+    dummy._sections["Song_Transition"]["allow_pre"] = True
+
+    async def _long_pcm(
+        _queue_id: str,
+        _program: dict[str, Any],
+        _section: PlannedSection,
+        pcm_format: AudioFormat,
+    ) -> bytes:
+        # a break long enough to want a full head, against a boundary that is closer
+        return b"\x00\x00" * int(20 * pcm_format.sample_rate) * pcm_format.channels
+
+    dummy._render_section_pcm = _long_pcm  # type: ignore[method-assign]
+    await dummy._replan_queue("queue-1")
+    await _due_term(dummy, tracks, 1, 10.0)
+
+    assert dummy.mass.overlays == []
+    cut = next(term for term in _terms(dummy) if term.successor_id == tracks[2].queue_item_id)
+    assert cut.dropped_reason == "too_late"
+
+
+async def test_a_too_close_gap_without_a_bus_inserts_nothing(tmp_path: Path) -> None:
+    """Without a flow session a too-close gap stays empty, exactly as before."""
+    tracks = [_track(index) for index in range(4)]
+    for track in tracks:
+        track.duration = TRACK_SECONDS
+    dummy = _make_replan_dj(tmp_path, tracks)
+    dummy.player_queues._queue.current_item = tracks[0]
+    dummy.player_queues._queue.corrected_elapsed_time = POSITION_SECONDS
+
+    await _replan_with_the_guard_moved(dummy, 1)
+
+    assert dummy.mass.overlays == []
+    assert dummy.rendered == []
+    assert _announced_gaps(dummy) == {tracks[3].queue_item_id}
+
+
+async def test_a_too_close_gap_with_the_switch_on_but_no_live_stream_inserts_nothing(
+    tmp_path: Path,
+) -> None:
+    """The switch alone is not enough: without a live bus the gap stays an empty item gap."""
+    tracks = [_track(index) for index in range(4)]
+    for track in tracks:
+        track.duration = TRACK_SECONDS
+    dummy = _make_replan_dj(tmp_path, tracks)
+    # the experimental switch is on, but this queue's stream carries no program bus
+    dummy.mass.streams.program_bus_enabled_flag = True
+    dummy.player_queues._queue.current_item = tracks[0]
+    dummy.player_queues._queue.corrected_elapsed_time = POSITION_SECONDS
+
+    await _replan_with_the_guard_moved(dummy, 1)
+    await _drain_tasks(dummy.mass)
+    # the play's flow session may still arrive, so the terms first wait out their grace
+    for term in _terms(dummy):
+        term.bus_missing_since = asyncio.get_running_loop().time() - BUS_GRACE_SECONDS - 1
+    await dummy._pump_terms("queue-1")
+
+    assert dummy.mass.overlays == []
+    assert dummy.rendered == []
+    assert dummy.player_queues.loads == []
+    assert [term.dropped_reason for term in _terms(dummy)] == ["no_bus", "no_bus", "no_bus"]
+    # a term that never aired holds nothing back: the gap may be planned again
+    store = dummy._term_store("queue-1")
+    assert store.state((tracks[1].queue_item_id, tracks[2].queue_item_id)) is (BoundaryState.OPEN)
+
+
+async def test_a_plannable_gap_becomes_a_term_not_a_clip(tmp_path: Path) -> None:
+    """A planned boundary is decided as a term, and the queue keeps its items."""
+    dummy, _tracks = _overlay_dj(tmp_path)
+
+    await dummy._replan_queue("queue-1")
+
+    assert dummy.mass.overlays == []
+    assert dummy.player_queues.loads == []
+    assert len(_terms(dummy)) == 3
+
+
+async def test_a_clip_the_queue_still_holds_is_taken_out_before_its_term(
+    tmp_path: Path,
+) -> None:
+    """A clip the queue still holds goes once the bus plans its boundary as a term."""
+    dummy, tracks = _overlay_dj(tmp_path)
+    state = dummy._dj_queues["queue-1"]
+    existing = _dj_clip(tracks[2].queue_item_id, state.dj_session_id)
+    dummy.player_queues._items = [tracks[0], tracks[1], existing, tracks[2], tracks[3]]
+
+    await dummy._replan_queue("queue-1")
+
+    assert dummy.mass.overlays == []
+    assert dummy.player_queues.deleted == [existing.queue_item_id]
+    assert dummy.player_queues.loads == []
+    # the boundary the clip served is decided as a term for this session
+    assert len(_terms(dummy)) == 3
+    store = dummy._term_store("queue-1")
+    assert store.state((tracks[1].queue_item_id, tracks[2].queue_item_id)) is (
+        BoundaryState.DECIDED
+    )
+    assert state.decided_gap_ids == set()
+
+
+async def test_switching_the_bus_on_takes_the_item_clips_out_before_a_term(
+    tmp_path: Path,
+) -> None:
+    """A queue switched to terms never airs an item clip and a term at the same boundary."""
+    tracks = [_track(index) for index in range(4)]
+    dummy = _make_replan_dj(tmp_path, tracks)
+    queue = dummy.player_queues._queue
+    queue.current_item = tracks[0]
+    queue.corrected_elapsed_time = POSITION_SECONDS
+
+    # the flag-off path speaks both boundaries as queue items
+    await dummy._replan_queue("queue-1")
+    assert (
+        len(
+            [
+                item
+                for item in dummy.player_queues.items("queue-1")
+                if item.extra_attributes.get(ATTR_QUEUE_DJ)
+            ]
+        )
+        == 2
+    )
+    loads_before_switch = list(dummy.player_queues.loads)
+
+    # switching the program bus on takes them out before a term is planned for the same gap
+    dummy.mass.activate_program_bus("queue-1")
+    await dummy._replan_queue("queue-1")
+
+    assert [
+        item
+        for item in dummy.player_queues.items("queue-1")
+        if item.extra_attributes.get(ATTR_QUEUE_DJ)
+    ] == []
+    # the released gaps are planned as terms, never spliced as items again
+    assert dummy.player_queues.loads == loads_before_switch
+    assert len(_terms(dummy)) == 3
+    # and the boundary is spoken over the stream instead of by a clip item
+    await _due_term(dummy, tracks, 1, 8.0)
+    assert len(dummy.mass.overlays) == 1
+
+
+async def test_an_event_after_the_switch_takes_the_item_clips_out(tmp_path: Path) -> None:
+    """A queue event after the switch purges the clips before the term pass can air them."""
+    tracks = [_track(index) for index in range(4)]
+    dummy = _make_replan_dj(tmp_path, tracks)
+    queue = dummy.player_queues._queue
+    queue.current_item = tracks[0]
+    queue.corrected_elapsed_time = POSITION_SECONDS
+    await dummy._replan_queue("queue-1")
+    assert any(
+        item.extra_attributes.get(ATTR_QUEUE_DJ) for item in dummy.player_queues.items("queue-1")
+    )
+
+    dummy.mass.activate_program_bus("queue-1")
+    await dummy._on_dj_queue_event(
+        SimpleNamespace(event=EventType.QUEUE_UPDATED, object_id="queue-1")
+    )
+    await _drain_tasks(dummy.mass)
+
+    # the event's own pass planned the boundaries again, and no clip item is left
+    assert not any(
+        item.extra_attributes.get(ATTR_QUEUE_DJ) for item in dummy.player_queues.items("queue-1")
+    )
+    assert len(_terms(dummy)) == 3
+
+
+async def test_a_gap_that_vanished_gets_neither_a_clip_nor_an_overlay(tmp_path: Path) -> None:
+    """A target that left the queue mid-pass is not spoken over either."""
+    dummy, tracks = _overlay_dj(tmp_path)
+    prepare = dummy._prepare_runtime_tokens
+
+    async def _remove_target(program: dict[str, Any]) -> dict[str, str]:
+        dummy.player_queues.update_items(
+            "queue-1",
+            [item for item in dummy.player_queues.items("queue-1") if item is not tracks[2]],
+        )
+        return await prepare(program)
+
+    dummy._prepare_runtime_tokens = _remove_target  # type: ignore[method-assign]
+    await dummy._replan_queue("queue-1")
+    await _drain_tasks(dummy.mass)
+
+    assert dummy.mass.overlays == []
+    assert dummy.player_queues.loads == []
+    # the boundary whose target left the queue is given up, never spoken over a new one
+    await _due_term(dummy, tracks, 1, 8.0)
+    assert dummy.mass.overlays == []
+    assert (
+        next(
+            term.dropped_reason
+            for term in _terms(dummy)
+            if term.queue_item_id == tracks[1].queue_item_id
+        )
+        == "no_successor"
+    )
+
+
+async def test_an_unplayable_neighbour_gets_no_break_and_no_overlay(tmp_path: Path) -> None:
+    """A boundary with a track that cannot play is not spoken over at all."""
+    tracks = [_track(index) for index in range(5)]
+    for track in tracks:
+        track.duration = TRACK_SECONDS
+    tracks[2].available = False
+    dummy = _make_replan_dj(tmp_path, tracks)
+    dummy.mass.activate_program_bus("queue-1")
+    dummy.player_queues._queue.current_item = tracks[0]
+    dummy.player_queues._queue.corrected_elapsed_time = POSITION_SECONDS
+
+    await dummy._replan_queue("queue-1")
+
+    assert dummy.mass.overlays == []
+    assert dummy.rendered == []
+    announced = _announced_gaps(dummy)
+    assert tracks[2].queue_item_id not in announced
+    assert tracks[3].queue_item_id not in announced
+
+
+async def test_a_paused_queue_gets_no_transition_overlay(tmp_path: Path) -> None:
+    """A queue that is not playing is not spoken over, however close the boundary is."""
+    dummy, _tracks = _overlay_dj(tmp_path)
+    dummy.player_queues._queue.state = PlaybackState.PAUSED
+
+    await _replan_with_the_guard_moved(dummy, 1)
+
+    assert dummy.mass.overlays == []
+
+
+async def test_each_boundary_gets_one_term_and_never_two(tmp_path: Path) -> None:
+    """Two boundaries behind each other are decided once each, however often a pass runs."""
+    dummy, _tracks = _overlay_dj(tmp_path)
+
+    await _replan_with_the_guard_moved(dummy, 2)
+    assert len(_terms(dummy)) == 3
+    assert dummy.player_queues.loads == []
+
+    await dummy._replan_queue("queue-1")
+
+    assert len(_terms(dummy)) == 3
+    assert dummy.player_queues.loads == []
+
+
+async def test_a_posting_break_keeps_its_delay(tmp_path: Path) -> None:
+    """A break that plays on over the next intro still starts on its boundary."""
+    dummy, tracks = _overlay_dj(tmp_path)
+    dummy._sections["Song_Transition"]["allow_post"] = True
+
+    await dummy._replan_queue("queue-1")
+    await _due_term(dummy, tracks, 1, 8.0)
+
+    assert len(dummy.mass.overlays) == 1
+    assert dummy.mass.overlays[0][3] == pytest.approx(8.0 - TERM_START_BIAS_SECONDS)
+
+
+async def test_a_break_is_dropped_when_the_track_moves_on_while_it_renders(
+    tmp_path: Path,
+) -> None:
+    """A break timed to a boundary the player left while rendering is not aired elsewhere."""
+    dummy, tracks = _overlay_dj(tmp_path)
+    render = dummy._render_section_pcm
+    queue = dummy.player_queues._queue
+
+    async def _render_slowly(
+        queue_id: str, program: dict[str, Any], section: PlannedSection, pcm_format: AudioFormat
+    ) -> bytes:
+        # the track ends while the engine renders, so the boundary the break was written
+        # for is behind the player by the time the audio comes back
+        queue.current_item = tracks[2]
+        queue.corrected_elapsed_time = 1.0
+        return await render(queue_id, program, section, pcm_format)
+
+    dummy._render_section_pcm = _render_slowly  # type: ignore[method-assign]
+    await dummy._replan_queue("queue-1")
+
+    await _due_term(dummy, tracks, 1, 8.0)
+
+    assert dummy.mass.overlays == []
+    rendered = next(term for term in _terms(dummy) if term.successor_id == tracks[2].queue_item_id)
+    assert rendered.dropped_reason == "skipped"
+
+
+async def test_a_break_is_dropped_when_the_queue_stops_while_it_renders(
+    tmp_path: Path,
+) -> None:
+    """A break rendered while the queue paused is not mixed into a stream nobody hears."""
+    dummy, tracks = _overlay_dj(tmp_path)
+    render = dummy._render_section_pcm
+    queue = dummy.player_queues._queue
+
+    async def _render_slowly(
+        queue_id: str, program: dict[str, Any], section: PlannedSection, pcm_format: AudioFormat
+    ) -> bytes:
+        queue.state = PlaybackState.PAUSED
+        return await render(queue_id, program, section, pcm_format)
+
+    dummy._render_section_pcm = _render_slowly  # type: ignore[method-assign]
+    await dummy._replan_queue("queue-1")
+
+    await _due_term(dummy, tracks, 1, 8.0)
+
+    # a render that landed in a pause is not placed and not lost: the term waits again
+    assert dummy.mass.overlays == []
+    waiting = next(term for term in _terms(dummy) if term.successor_id == tracks[2].queue_item_id)
+    assert waiting.state is TermState.DECIDED
+
+
+def _gap_section() -> PlannedSection:
+    """Return the plan of the break in front of the third track."""
+    return PlannedSection(
+        order=0,
+        clip_id="",
+        section_id="Song_Transition",
+        section_name="Song Transition",
+        when="between_songs",
+        insert_at_index=2,
+        prompt="",
+        max_chars=200,
+        web_search_mode="disabled",
+    )
+
+
+def _dj_program(dummy: ReplanQueueDJ) -> dict[str, Any]:
+    """Return the program a break on the harness's DJ belongs to."""
+    return dummy._build_program({"id": "morning_show", "name": "AI DJ Rick"}, dummy._hosts["rick"])
+
+
+async def test_an_intro_that_trips_the_cooldown_books_the_same_wake_up(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """The intro path pauses the DJ through the same place as a break does."""
+    dummy = _armed_intro_dj(tmp_path)
+    state = dummy._dj_queues["queue-1"]
+    state.render_health.tts.failures = RENDER_FAILURES_BEFORE_COOLDOWN - 1
+    dummy.fail_overlay_render = True
+
+    with caplog.at_level(logging.WARNING):
+        await dummy._place_intro_overlay("queue-1", state)
+    await _drain_tasks(dummy.mass)
+
+    assert dummy.mass.overlays == []
+    assert state.render_health.cooling_down(asyncio.get_running_loop().time())
+    assert (
+        TTS_COOLDOWN_SECONDS,
+        dummy._schedule_replan,
+        ("queue-1",),
+        "ai_radio_dj_cooldown_queue-1",
+    ) in dummy.mass.timers
+    assert "pauses the breaks on queue queue-1" in caplog.text
+
+
+async def test_the_intro_is_not_rendered_while_the_breaks_are_paused(tmp_path: Path) -> None:
+    """An engine that is paused for failing is not paid for the intro either."""
+    dummy = _armed_intro_dj(tmp_path)
+    state = dummy._dj_queues["queue-1"]
+    state.render_health.tts.cooldown_until = asyncio.get_running_loop().time() + 100
+
+    await dummy._place_intro_overlay("queue-1", state)
+
+    assert dummy.rendered == []
+    assert dummy.mass.overlays == []
+
+
+async def test_a_failed_intro_counts_against_the_dj(tmp_path: Path) -> None:
+    """A failed intro render counts towards the pause of the queue's breaks."""
+    dummy = _armed_intro_dj(tmp_path)
+    state = dummy._dj_queues["queue-1"]
+    state.render_health.tts.failures = RENDER_FAILURES_BEFORE_COOLDOWN - 1
+    dummy.fail_overlay_render = True
+
+    await dummy._place_intro_overlay("queue-1", state)
+
+    assert state.render_health.cooling_down(asyncio.get_running_loop().time())
+
+
+async def test_a_successful_intro_clears_the_failures(tmp_path: Path) -> None:
+    """An intro that comes back clears the failure count the DJ was holding."""
+    dummy = _armed_intro_dj(tmp_path)
+    state = dummy._dj_queues["queue-1"]
+    state.render_health.tts.failures = 2
+
+    await dummy._place_intro_overlay("queue-1", state)
+
+    assert state.render_health.tts.failures == 0
+    assert len(dummy.mass.overlays) == 1
+
+
+async def test_the_intro_hold_ends_at_its_deadline_without_another_queue_event(
+    tmp_path: Path,
+) -> None:
+    """A hanging intro render stops holding the breaks back at the deadline it was given."""
+    dummy = _armed_intro_dj(tmp_path)
+
+    async def _hang(*_args: Any) -> bytes:
+        await asyncio.Event().wait()
+        raise AssertionError("the hanging render never returns")
+
+    dummy._render_section_pcm = _hang  # type: ignore[assignment]
+    state = dummy._dj_queues["queue-1"]
+    dummy._start_intro_overlay("queue-1", state)
+    hold = next(timer for timer in dummy.mass.timers if timer[3] == "ai_radio_intro_hold_queue-1")
+
+    assert dummy._intro_holds_breaks("queue-1", state) is True
+
+    hold[1](*hold[2])
+
+    assert state.intro_until is None
+    assert dummy._intro_holds_breaks("queue-1", state) is False
+    # the pass that would plan the breaks is booked without waiting for a queue event
+    assert state.replan_pending is True
+    for task in dummy.mass.tasks:
+        task.cancel()
+    await asyncio.sleep(0)
+
+
+async def test_a_skip_while_the_intro_renders_drops_it(tmp_path: Path) -> None:
+    """An intro rendered for a track the listener skipped past is not spoken over the next."""
+    tracks = [_track(index) for index in range(4)]
+    dummy = _make_replan_dj(tmp_path, tracks, host=_intro_host())
+    dummy.mass.activate_program_bus("queue-1")
+    queue = dummy.player_queues._queue
+    queue.current_item = tracks[0]
+    render = dummy._render_section_pcm
+
+    async def _render_slowly(
+        queue_id: str, program: dict[str, Any], section: PlannedSection, pcm_format: AudioFormat
+    ) -> bytes:
+        # the listener skips to the next track while the engine works
+        queue.current_item = tracks[1]
+        return await render(queue_id, program, section, pcm_format)
+
+    dummy._render_section_pcm = _render_slowly  # type: ignore[method-assign]
+
+    await dummy.set_queue_dj("queue-1", "rick")
+    await _drain_tasks(dummy.mass)
+
+    assert dummy.mass.overlays == []
+    assert not _intro_pending(dummy)
+
+
+async def test_loading_another_album_before_the_play_drops_the_owed_intro(
+    tmp_path: Path,
+) -> None:
+    """An intro owed to a paused album is not spoken over the album loaded after it."""
+    tracks = [_track(index) for index in range(4)]
+    dummy = _make_replan_dj(tmp_path, tracks, host=_intro_host())
+    # the switch is on; the queue is paused and its flow session does not exist yet
+    dummy.mass.streams.program_bus_enabled_flag = True
+    queue = dummy.player_queues._queue
+    queue.state = PlaybackState.PAUSED
+    queue.current_item = tracks[0]
+
+    await dummy.set_queue_dj("queue-1", "rick")
+    await _drain_tasks(dummy.mass)
+    assert _intro_pending(dummy)
+
+    # another album is loaded and playback starts on it
+    other = [_track(index) for index in range(10, 14)]
+    dummy.player_queues._items = other
+    queue.current_item = other[0]
+    queue.state = PlaybackState.PLAYING
+    dummy.mass.activate_program_bus("queue-1")
+    await dummy._replan_queue("queue-1")
+    await _drain_tasks(dummy.mass)
+
+    assert dummy.mass.overlays == []
+    assert not _intro_pending(dummy)
+
+
+async def test_playback_ending_while_the_intro_renders_drops_it(tmp_path: Path) -> None:
+    """An intro that comes back after its playback ended is not mixed into the next one."""
+    tracks = [_track(index) for index in range(4)]
+    dummy = _make_replan_dj(tmp_path, tracks, host=_intro_host())
+    dummy.mass.activate_program_bus("queue-1")
+    queue = dummy.player_queues._queue
+    queue.current_item = tracks[0]
+    render = dummy._render_section_pcm
+
+    async def _render_slowly(
+        program: dict[str, Any], section: PlannedSection, pcm_format: AudioFormat
+    ) -> bytes:
+        # the queue runs out of items while the engine works
+        queue.ended = True
+        return await render(program, section, pcm_format)
+
+    dummy._render_section_pcm = _render_slowly  # type: ignore[method-assign]
+
+    await dummy.set_queue_dj("queue-1", "rick")
+    await _drain_tasks(dummy.mass)
+
+    assert dummy.mass.overlays == []
+
+
+async def test_the_program_bus_switch_off_books_no_intro_lookups(tmp_path: Path) -> None:
+    """With the switch off no look for a stream that can never carry an intro is booked."""
+    dummy = _make_replan_dj(tmp_path, [_track(index) for index in range(4)], host=_intro_host())
+    assert dummy.mass.streams.program_bus_enabled_flag is False
+
+    await dummy.set_queue_dj("queue-1", "rick")
+    await _drain_tasks(dummy.mass)
+
+    assert [
+        timer for timer in dummy.mass.timers if timer[3] == "ai_radio_intro_retry_queue-1"
+    ] == []
+    assert not _intro_pending(dummy)
+
+
+async def test_a_failed_transition_render_settles_the_gap_without_an_item(
+    tmp_path: Path,
+) -> None:
+    """A break that fails to render is logged, leaves no item and is not retried forever."""
+    dummy, tracks = _overlay_dj(tmp_path)
+    dummy.fail_overlay_render = True
+
+    await dummy._replan_queue("queue-1")
+    await _drain_tasks(dummy.mass)
+    await _due_term(dummy, tracks, 1, 8.0)
+
+    assert dummy.mass.overlays == []
+    assert len(dummy.rendered) == 1
+    failed = next(term for term in _terms(dummy) if term.successor_id == tracks[2].queue_item_id)
+    assert failed.dropped_reason == "render_failed"
+    # the break never aired, so it holds neither its guard nor its gap back
+    assert tracks[2].queue_item_id not in dummy._dj_queues["queue-1"].decided_gap_ids
+
+    await dummy._replan_queue("queue-1")
+    await _drain_tasks(dummy.mass)
+    # the pass books itself for the moment its budget window opens, as it does in production;
+    # it lands a moment inside the window, never exactly on its edge
+    window = (
+        dummy._term_estimate("queue-1").seconds
+        + LEAD_MIN_LEAD_SECONDS
+        + TERM_SCHEDULE_TOLERANCE_SECONDS
+    )
+    await _due_term(dummy, tracks, 1, window - 0.5)
+
+    # a later pass tries the open gap again, and still makes no item for it
+    assert len(dummy.rendered) == 2
+    assert dummy.mass.overlays == []
+    assert dummy.player_queues.loads == []
+
+
+async def test_the_program_bus_switch_off_keeps_the_item_behaviour(tmp_path: Path) -> None:
+    """With the experimental switch off a too-close gap behaves exactly as on dev."""
+    dummy, tracks = _overlay_dj(tmp_path)
+    dummy.mass.streams.program_bus_enabled_flag = False
+
+    await _replan_with_the_guard_moved(dummy, 1)
+
+    assert dummy.mass.overlays == []
+    assert dummy.rendered == []
+    assert _announced_gaps(dummy) == {tracks[3].queue_item_id}

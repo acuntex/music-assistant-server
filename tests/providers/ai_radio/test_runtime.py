@@ -25,6 +25,7 @@ from music_assistant.providers.ai_radio.constants import (
     CONF_AI_ENGINE,
     CONF_TTS_ENGINE,
     CONF_WEATHER_PROVIDER,
+    MAX_CONTRIBUTION_DEFAULT_SECONDS,
     TTS_PRONUNCIATION_INSTRUCTIONS,
 )
 from music_assistant.providers.ai_radio.models import PlannedSection, Slot
@@ -1148,6 +1149,19 @@ def test_build_program_merges_host_into_station() -> None:
     assert [s["id"] for s in program["sections"]] == ["Song_Transition"]
     assert program["section_order"] == host["section_order"]
     assert program["source_playlist_id"] == "p1"
+    # a host stored before the setting existed speaks up to the default ceiling
+    assert program["max_contribution_seconds"] == MAX_CONTRIBUTION_DEFAULT_SECONDS
+
+
+def test_build_program_carries_the_hosts_contribution_ceiling() -> None:
+    """The host's ceiling for one spoken contribution reaches the render path."""
+    runtime = DummyRuntime()
+    runtime._sections = {}
+    host = {"id": "rick", "name": "Rick", "section_ids": [], "max_contribution_seconds": 20}
+
+    program = runtime._build_program({"id": "station_a", "name": "Station A"}, host)
+
+    assert program["max_contribution_seconds"] == 20.0
 
 
 def test_clip_item_carries_host_id() -> None:
