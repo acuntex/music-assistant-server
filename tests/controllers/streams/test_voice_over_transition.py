@@ -3,18 +3,24 @@
 from __future__ import annotations
 
 import asyncio
+import struct
 from collections.abc import AsyncGenerator
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import MagicMock
 
+import pytest
 from music_assistant_models.enums import CrossfadeMode, MediaType
 from music_assistant_models.errors import QueueEmpty
 from music_assistant_models.streamdetails import TailOverlap
 
 from music_assistant.controllers.streams import audio as audio_module
 from music_assistant.controllers.streams.audio import StreamsAudio
-from music_assistant.controllers.streams.constants import MIN_VOICE_OVER_DURATION, VOICE_OVER_RAMP
+from music_assistant.controllers.streams.constants import (
+    MIN_VOICE_OVER_DURATION,
+    VOICE_OVER_RAMP,
+)
+from music_assistant.controllers.streams.program_mixer import _ProgramOverlay
 from music_assistant.controllers.streams.smart_fades.fades import VoiceOverFade
 from tests.controllers.streams.test_crossfade_transition import (
     STANDARD_CROSSFADE_DURATION,
@@ -66,7 +72,9 @@ def _voice_over_audio(
 
     async def _build(**kwargs: Any) -> object:
         if kwargs["mode"] == CrossfadeMode.VOICE_OVER:
-            fade = VoiceOverFade(logger=audio.logger)
+            fade = VoiceOverFade(
+                logger=audio.logger, duck_side="out" if kwargs.get("lead") else "in"
+            )
             fade.build(len(kwargs["fade_out_data"]), kwargs["fade_in_bytes_len"], TEST_PCM_FORMAT)
             return fade
         return SimpleNamespace(
@@ -385,3 +393,25 @@ async def test_clip_cuts_to_the_track_when_its_audio_is_late(
     assert bytes(output) == bytes([0x10]) * CLIP_SECONDS * SAMPLE_SIZE + (
         bytes([0x40]) * TRACK_SECONDS * SAMPLE_SIZE
     )
+
+
+def test_a_program_overlay_ducks_the_music_and_sums_the_voice() -> None:
+    """The head of the clip is added over the outgoing track, whose level drops under it."""
+    pcm_format = TEST_PCM_FORMAT
+    frames = pcm_format.sample_rate
+    voice = struct.pack("<hh", 8, 8) * frames
+    overlay = _ProgramOverlay(voice, pcm_format, start_frame=0)
+    assert overlay.usable
+
+    music = struct.pack("<hh", 100, 100) * frames
+    mixed = overlay.mix(music, 0)
+
+    assert len(mixed) == len(music)
+    samples = struct.unpack(f"<{len(mixed) // 2}h", mixed)
+    # past the duck-in ramp the music sits at the ducked level under the voice
+    ducked = samples[int(VOICE_OVER_RAMP * frames) * 2 : len(samples) // 2]
+    assert max(ducked) < 60
+    # and it is louder than the ducked music alone once the voice plays
+    assert max(ducked) > 20
+    # the music is pulled down over the ramp instead of dropping at once
+    assert samples[0] > ducked[0]

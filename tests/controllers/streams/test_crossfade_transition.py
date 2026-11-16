@@ -26,6 +26,7 @@ from music_assistant.controllers.player_queues.state import PlayerQueueData
 from music_assistant.controllers.streams import audio as audio_module
 from music_assistant.controllers.streams.audio import StreamsAudio
 from music_assistant.controllers.streams.audio_buffer import AudioBuffer
+from music_assistant.controllers.streams.constants import CONF_STREAM_PROGRAM_BUS
 from music_assistant.controllers.streams.smart_fades.fades import StandardCrossFade
 
 TEST_PCM_FORMAT = AudioFormat(
@@ -34,8 +35,9 @@ TEST_PCM_FORMAT = AudioFormat(
     bit_depth=16,
     channels=2,
 )
-# deliberately not a whole second and not frame-aligned, so any assumption about
-# chunk boundaries in the transition path shows up as wrong audio
+# deliberately not a whole second, so any assumption about chunk boundaries in the
+# transition path shows up as wrong audio; 10668 is a whole number of the 4-byte frames of
+# this format, so the chunking is unusual here, not the alignment
 CHUNK_SIZE = TEST_PCM_FORMAT.pcm_sample_size // 3 + 2
 STANDARD_CROSSFADE_DURATION = 8
 
@@ -92,6 +94,8 @@ def _flow_audio(
     crossfade_mode: CrossfadeMode = CrossfadeMode.STANDARD_CROSSFADE,
     crossfade_allowed: bool = True,
     build_result: object | None = None,
+    program_bus: bool = False,
+    lead_hold: bool = False,
 ) -> tuple[StreamsAudio, SimpleNamespace, MagicMock]:
     """Build a StreamsAudio wired for a two-track flow stream."""
     queue = SimpleNamespace(
@@ -109,8 +113,14 @@ def _flow_audio(
     mass.player_queues.get.return_value = queue
     mass.player_queues.get_next_item.return_value = next_item
     mass.streams.get_crossfade_mode.return_value = crossfade_mode
+    # the experiment is off unless a test asks for it
+    mass.streams.get_config_value.side_effect = lambda key, *_args, **_kwargs: (
+        program_bus if key == CONF_STREAM_PROGRAM_BUS else None
+    )
     # these items are ours to mix, so no source claims their boundaries
     mass.streams.get_source_crossfade_mode.return_value = CrossfadeMode.DISABLED
+    # the item tails are only held wider for a lead; a plain crossfading queue asks for nothing
+    mass.streams.lead_hold_required.return_value = lead_hold
     mass.config.get_raw_core_config_value.return_value = STANDARD_CROSSFADE_DURATION
     mass.streams.audio_processing.update_item_context = MagicMock()
     player = MagicMock()
