@@ -175,6 +175,7 @@ class PlaybackTrackerMixin(_PlayerQueuesBase):
         queue.available = player.available
         queue.smart_fades_active = self.mass.streams.is_smart_fades_active(queue)
         queue.smart_shuffle_active = self.is_smart_shuffle_active(queue)
+        # the count is the number of rows the queue has: clients fetch items by index
         queue.items = len(self._queue_data[queue_id].items)
 
         queue.state = (

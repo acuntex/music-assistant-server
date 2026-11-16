@@ -110,6 +110,7 @@ from music_assistant.controllers.player_queues.state import (
 )
 from music_assistant.controllers.player_queues.stream_feeder import StreamFeederMixin
 from music_assistant.controllers.players.constants import SwitchedOffAction
+from music_assistant.controllers.streams.program_schedule import ScheduleReason
 from music_assistant.controllers.webserver.helpers.auth_middleware import (
     get_current_user,
     has_player_access,
@@ -1184,6 +1185,9 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         if next_index is None:
             self._set_transitioning(queue_id, False)
             return
+        # a jump leaves the programs of the boundaries it passes behind; an announcement that
+        # was already rendered is heard over the stream and anchored again on the bus it opens
+        self.mass.streams.cancel_overlays_of_a_jump(queue_id, ScheduleReason.SKIPPED, origin="next")
 
         # immediately update current item so UI shows the new track right away
         queue.current_index = next_index
@@ -1235,6 +1239,11 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         # restart current track if elapsed > 5s, otherwise go to previous
         if queue.corrected_elapsed_time < 5:
             prev_index = max(current_index - 1, 0)
+        # see next: an announcement mixed into the stream outlives a jump, a program of a
+        # boundary we no longer reach does not
+        self.mass.streams.cancel_overlays_of_a_jump(
+            queue_id, ScheduleReason.SKIPPED, origin="previous"
+        )
 
         # immediately update current item so UI shows the new track right away
         queue.current_index = prev_index
@@ -1277,6 +1286,9 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
             raise InvalidCommand(f"Queue {queue.display_name} has no item(s) loaded.")
         if not current_item.duration:
             raise InvalidCommand("Can not skip in items without duration.")
+        # a jump within the item is a seek: what speaks over a boundary the listener will no
+        # longer reach is dropped, an announcement that was already rendered is not
+        self.mass.streams.cancel_overlays_of_a_jump(queue_id, ScheduleReason.SEEKED, origin="skip")
         queue_data = self._queue_data[queue_id]
         if queue_data.pending_skip_item_id != current_item.queue_item_id:
             queue_data.pending_skip_seconds = 0
@@ -1407,6 +1419,11 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
     ) -> None:
         """Play item at index (or item_id) X in queue."""
         self._check_player_permission(queue_id)
+        # a jump to another item leaves its boundaries and its moment behind, not its
+        # announcements: see next
+        self.mass.streams.cancel_overlays_of_a_jump(
+            queue_id, ScheduleReason.SKIPPED, origin="play_index"
+        )
         await self._play_index(queue_id, index, seek_position or None, fade_in)
 
     @api_command(
@@ -1760,6 +1777,7 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         :param permanent: Also delete the queue's persisted state and items.
         """
         self.mass.streams.audio_processing.clear(player_id)
+        self.mass.players.on_queue_removed(player_id)
         self._cancel_pending_playback(player_id)
         # cancel a pending debounced cache write AND an already-started one, so neither can
         # recreate a deleted entry after the player is gone (the timer becomes a task once it fires)

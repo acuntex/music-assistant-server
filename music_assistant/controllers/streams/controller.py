@@ -30,6 +30,7 @@ from music_assistant_models.enums import (
     ContentType,
     CrossfadeMode,
     MediaType,
+    PlaybackState,
     PlayerFeature,
     ProviderType,
     VolumeNormalizationMode,
@@ -80,6 +81,7 @@ from music_assistant.controllers.streams.announcements import (
     AnnouncementRenderer,
 )
 from music_assistant.controllers.streams.audio import (
+    FlowProgramBus,
     StreamsAudio,
     overlay_active,
     overlay_mixed_in,
@@ -93,12 +95,14 @@ from music_assistant.controllers.streams.constants import (
     CONF_BUFFER_SIZE,
     CONF_BUFFER_SIZE_DEFAULT,
     CONF_SMART_FADES_LOG_LEVEL,
+    CONF_STREAM_PROGRAM_BUS,
     CONF_STREAM_SOURCE_MODE,
     CONF_UPGRADE_BELOW_QUALITY,
     DEFAULT_PORT,
     DEFAULT_VOLUME_NORMALIZATION_MODE,
     FLOW_STREAM_MAX_LEAD_OUT_SECONDS,
     ICY_WRITE_SIZE,
+    MAX_BUFFERED_LEAD_SECONDS,
     OUTCOME_ONLY_NORMALIZATION_MODES,
     BufferSize,
     PacingProfile,
@@ -108,6 +112,28 @@ from music_assistant.controllers.streams.constants import (
 from music_assistant.controllers.streams.live_announcements import (
     LIVE_ANNOUNCEMENT_STREAM_PATH,
     LiveAnnouncementManager,
+)
+from music_assistant.controllers.streams.program_bus_registry import (
+    ProgramBusEvent,
+    ProgramBusRegistry,
+)
+from music_assistant.controllers.streams.program_bus_view import (
+    ProgramBusClaims,
+    ProgramBusView,
+    build_program_bus_view,
+)
+from music_assistant.controllers.streams.program_ledger import OverlayState, ProgramLedger
+from music_assistant.controllers.streams.program_levels import ProgramLevels, checked_levels
+from music_assistant.controllers.streams.program_schedule import (
+    KINDS_A_JUMP_DROPS,
+    ProgramKind,
+    ProgramPriority,
+    ProgramRequest,
+    ScheduleReason,
+    ScheduleResult,
+    place_program,
+    priority_for,
+    refused,
 )
 from music_assistant.controllers.streams.stream_sources import StreamSourceMode, UpgradeQuality
 from music_assistant.helpers.api import api_command
@@ -384,6 +410,27 @@ class StreamsController(CoreController):
         # owners (e.g. a plugin) that require flow mode for a queue, by queue id
         self._flow_mode_owners: dict[str, set[str]] = {}
         self._boundary_mix_owners: dict[str, set[str]] = {}
+        # owners whose clips may start over an item's tail, so it is held back for them
+        self._lead_hold_owners: dict[str, set[str]] = {}
+        # the programs placed or refused per queue; the only source of overlay_state. A
+        # program it drops is cancelled on the live bus, and one it aired is reported to
+        # whoever holds its audio, through these hooks.
+        self._program_ledger = ProgramLedger(
+            on_dropped=self._overlay_was_dropped,
+            on_aired=self._overlay_was_aired,
+            logger=self.logger,
+        )
+        self._program_aired_listeners: list[Callable[[str, str], None]] = []
+        # the program bus of every live flow session, by queue id; it ends the programs of
+        # a bus that is replaced or released and tells listeners about the change
+        self._program_buses = ProgramBusRegistry(
+            self._program_ledger,
+            heard_frame=self._audible_frame,
+            logger=self.logger,
+        )
+        # queues whose last program was placed without a position to go by, so the
+        # fallback is logged once instead of with every program
+        self._overlays_without_position: set[str] = set()
 
     @property
     def audio_analysis(self) -> AudioAnalysisController:
@@ -571,6 +618,30 @@ class StreamsController(CoreController):
         """
         return queue_id in self._boundary_mix_owners
 
+    def set_lead_hold_required(self, queue_id: str, owner: str, required: bool) -> None:
+        """
+        Require (or release) that the queue's item tails are held for a lead, on behalf of an owner.
+
+        A lead is a declared head that starts before the item it belongs to ends, so the
+        item before it is held back: one crossfade is not enough for a long lead, and the
+        plan only exists once the boundary is reached. Only a queue whose owner may place
+        such a lead asks for it - a queue that merely mixes its boundaries, e.g. for a
+        break that carries over the next item, needs no wider hold than its crossfade.
+
+        :param queue_id: Queue whose item tails are held for a lead.
+        :param owner: Identifier of the requester, e.g. a provider instance id.
+        :param required: True to require it, False to release this owner's claim.
+        """
+        self._set_required(self._lead_hold_owners, queue_id, owner, required)
+
+    def lead_hold_required(self, queue_id: str) -> bool:
+        """
+        Return whether any owner may place a lead over the queue's item tails.
+
+        :param queue_id: Queue to check.
+        """
+        return queue_id in self._lead_hold_owners
+
     def mixes_item_boundaries(self, queue_id: str) -> bool:
         """
         Return whether the server mixes the boundary between two items for the queue's player.
@@ -582,6 +653,382 @@ class StreamsController(CoreController):
         """
         player = self.mass.players.get_player(queue_id)
         return player is not None and (player.flow_mode or player.supports_gapless)
+
+    def program_bus_enabled(self) -> bool:
+        """Return whether the streams program bus is switched on (it is experimental)."""
+        return self.get_config_value(CONF_STREAM_PROGRAM_BUS, False, return_type=bool)
+
+    def register_program_bus(self, queue_id: str, program_bus: FlowProgramBus) -> None:
+        """
+        Publish the program bus of a flow session that just started for the queue.
+
+        :param queue_id: Queue the session streams.
+        :param program_bus: The session's program bus.
+        """
+        self._program_buses.register(queue_id, program_bus)
+
+    def release_program_bus(self, queue_id: str, program_bus: FlowProgramBus) -> None:
+        """
+        Withdraw the program bus of a flow session of the queue that ended.
+
+        :param queue_id: Queue the session streamed.
+        :param program_bus: The session's program bus.
+        """
+        self._program_buses.release(queue_id, program_bus)
+
+    def add_program_aired_listener(
+        self, listener: Callable[[str, str], None]
+    ) -> Callable[[], None]:
+        """
+        Subscribe to the programs the ledger reports as aired.
+
+        :param listener: Called with (queue_id, label) when a program was heard to its end.
+        :return: A callback that removes the listener again.
+        """
+        self._program_aired_listeners.append(listener)
+
+        def _remove() -> None:
+            with suppress(ValueError):
+                self._program_aired_listeners.remove(listener)
+
+        return _remove
+
+    def add_program_bus_listener(
+        self, listener: Callable[[ProgramBusEvent], None]
+    ) -> Callable[[], None]:
+        """
+        Subscribe to the queue buses appearing, being replaced and ending.
+
+        :param listener: Called with the queue and the change for every bus change.
+        :return: A callback that removes the listener again.
+        """
+        return self._program_buses.add_listener(listener)
+
+    def program_bus_active(self, queue_id: str) -> bool:
+        """
+        Return whether the queue has a flow session that can mix a program right now.
+
+        :param queue_id: Queue to check.
+        """
+        return self._program_buses.active(queue_id)
+
+    def program_bus_format(self, queue_id: str) -> AudioFormat | None:
+        """
+        Return the PCM format a program for the queue has to be delivered in.
+
+        :param queue_id: Queue to check.
+        :return: The PCM format of the queue's live flow session, or None without one.
+        """
+        return self._program_buses.pcm_format(queue_id)
+
+    def program_levels(self, queue_id: str) -> ProgramLevels:
+        """
+        Return the level the queue mixes its programs at.
+
+        :param queue_id: Queue to check.
+        """
+        return self._program_buses.levels(queue_id)
+
+    def set_program_levels(
+        self, queue_id: str, *, voice_db: float = 0.0, duck_db: float | None = None
+    ) -> None:
+        """
+        Set the level the queue mixes its programs at, and how far it ducks the music.
+
+        The voice level is a gain on the program's own audio, applied inside the bus before
+        it is summed over the music, so it moves the voice and not the music below it and it
+        holds for every program of the queue, announcements included. The ducking depth is
+        the envelope the same queue's music goes down by while a program plays.
+
+        :param queue_id: Queue whose programs are mixed at the given level.
+        :param voice_db: Gain of the program's audio in decibels, 0 to -9 dB.
+        :param duck_db: Level the music goes down to under a program, 0 to -12 dB, or None
+            for the ducking depth a boundary's voice-over uses.
+        :raises ValueError: When a value is not a number or outside the range it may take.
+        """
+        self._program_buses.set_levels(queue_id, checked_levels(voice_db, duck_db))
+
+    def program_bus_lead_seconds(self, queue_id: str) -> float | None:
+        """
+        Return how far the queue's stream has produced ahead of what the listener heard.
+
+        The bus can not mix a program into frames it already emitted, so this lead is the
+        time a program planned for a boundary needs on top of its delay to reach that
+        boundary at all. It is the buffer between the producer and the player, not a part of
+        the program.
+
+        :param queue_id: Queue whose stream to measure.
+        :return: Seconds between the produced frames and the position the listener reached,
+            or None without a live bus or without a position that can be told.
+        """
+        program_bus = self._program_buses.get(queue_id)
+        if program_bus is None:
+            return None
+        audible_frame = self._audible_frame(queue_id, program_bus)
+        if audible_frame is None:
+            return None
+        produced = program_bus.produced_frames - audible_frame
+        return max(0, produced) / program_bus.pcm_format.sample_rate
+
+    def schedule_overlay(
+        self,
+        queue_id: str,
+        pcm: bytes,
+        *,
+        label: str,
+        start_in_seconds: float = 0.0,
+        priority: ProgramPriority | None = None,
+        kind: ProgramKind = ProgramKind.TERM,
+        head_seconds: float = 0.0,
+    ) -> ScheduleResult:
+        """
+        Mix a short program into the queue's live flow stream, a moment from now.
+
+        The program is placed a minimum lead after the position the queue's player reports,
+        so it is heard from where the listener really is, however far the session already
+        produced ahead of it; the bus keeps it out of the produced frames itself when the
+        player holds more than that lead. A delay is counted from the same point, so a
+        program planned for a boundary still to come starts where the listener will be at
+        that boundary, not wherever the bus had already produced. Nothing is scheduled while
+        the queue has no live flow session.
+
+        A program timed to a boundary (``start_in_seconds`` above zero) needs a position the
+        listener has reached: without one it is not placed at all, because counting the
+        delay from the producer's edge would put it seconds away from the boundary it was
+        written for. Only an immediate program (an announcement) keeps that fallback.
+
+        A program that lands in the window of one already scheduled is settled by priority:
+        a higher priority program keeps its anchor and the lower one is dropped, and a lower
+        priority one is dropped itself. Two programs of the same priority are mixed one after
+        the other, as before.
+
+        The answer separates the two reasons a program can start later than planned:
+        ``late_by_seconds`` is how far the producer already emitted past the boundary, and
+        ``lead_shortfall_seconds`` is how much of the intended start the bus's minimum lead
+        took. Both are measured on the intended boundary, before a taken window moves the
+        anchor, and the lead is never reported as lateness.
+
+        Audio that the bus can not mix (a passthrough format, or nothing at all) is refused
+        as ``format``. Audio whose length is not a whole frame is mixed up to its last whole
+        frame. A program without a single whole frame is refused the same way.
+
+        An announcement or an intro is immediate: passing ``start_in_seconds`` above zero for
+        one of them raises ``ValueError``, because a program without a boundary can not be
+        planned for one. A rank that does not match the kind is rejected the same way.
+        When the ledger's bounded history has to give up a program that is still to be heard,
+        it ends as ``dropped(ledger_evicted)`` (an announcement stays visible as ``orphaned``)
+        and the loss is logged.
+
+        :param queue_id: Queue whose stream the program is heard over.
+        :param pcm: The program's audio, in the format the session produces
+            (see program_bus_format).
+        :param label: Name of the program, for the log.
+        :param start_in_seconds: Seconds from what the listener hears to where the program
+            starts, so it lands on a boundary that is still to come. A value below the
+            minimum lead the bus needs is raised to that lead, and a negative one is
+            clamped to zero.
+        :param priority: How strongly the program claims the window it lands in. It follows
+            from the kind (announcement/intro over lead over term over crossplay); a value that
+            contradicts the kind is rejected.
+        :param kind: What the program is for. A term, lead or crossplay that missed its
+            boundary by more than ``MAX_OVERLAY_LATE_SECONDS`` is dropped; an announcement or
+            intro has no boundary to miss, so a deep buffer never discards it. Only an
+            announcement may be anchored again on the bus that replaced the one it was placed
+            on.
+        :param head_seconds: Seconds the program was planned to start before the boundary it
+            belongs to, for the log and the audio path's details. It is not part of the
+            placement: the caller counted it into ``start_in_seconds`` already.
+        :return: Where the program was anchored and why, or why it was not placed.
+        """
+        if kind in (ProgramKind.ANNOUNCEMENT, ProgramKind.INTRO) and start_in_seconds > 0:
+            raise ValueError(
+                f"kind {kind!s} has no boundary, so a delay it is planned for is invalid"
+            )
+        rank = priority_for(kind)
+        if priority is None:
+            priority = rank
+        elif priority != rank:
+            raise ValueError(
+                f"priority {priority!s} does not match kind {kind!s} (which ranks {rank!s})"
+            )
+        if (program_bus := self._program_buses.get(queue_id)) is None:
+            self.logger.info(
+                "No flow stream is mixing programs for queue %s - %s can not be mixed in",
+                queue_id,
+                label,
+            )
+            # nothing of the queue streamed the program, so its ledger does not change
+            return refused(ScheduleReason.NO_BUS)
+
+        def _report_no_position(ahead: bool, seconds: float) -> None:
+            self._report_no_position(
+                queue_id,
+                label,
+                "PROGRAM-BUS no audible position for queue %s - %s is not placed %ss ahead"
+                if ahead
+                else "PROGRAM-BUS no audible position for queue %s - %s is placed %ss after "
+                "the produced frames",
+                seconds,
+            )
+
+        audible_frame = self._audible_frame(queue_id, program_bus)
+        if audible_frame is not None:
+            # a position is known again, so a later fallback is worth reporting again
+            self._overlays_without_position.discard(queue_id)
+        return place_program(
+            program_bus,
+            pcm,
+            request=ProgramRequest(
+                queue_id=queue_id,
+                label=label,
+                start_in_seconds=start_in_seconds,
+                priority=priority,
+                kind=kind,
+                head_seconds=head_seconds,
+            ),
+            audible_frame=audible_frame,
+            ledger=self._program_ledger,
+            logger=self.logger,
+            report_no_position=_report_no_position,
+        )
+
+    def cancel_overlay(
+        self, queue_id: str, label: str, reason: str, *, start_frame: int | None = None
+    ) -> bool:
+        """
+        Drop the programs with the given label from the queue's flow stream.
+
+        A label identifies a program; when several programs were scheduled under the same
+        label, all of them are dropped, unless an anchor is given to pick one. Runs
+        synchronously: the queue must be able to move on at once, and what was cancelled is
+        never made up for later.
+
+        :param queue_id: Queue whose program is dropped.
+        :param label: Label the program was scheduled with.
+        :param reason: Why it is dropped, for the log.
+        :param start_frame: Anchor of the one program to drop, or None for every one with
+            that label.
+        :return: Whether a program with that label was still to be heard.
+        """
+        self._program_ledger.refresh(queue_id, self._heard_frames(queue_id))
+        program_bus = self._program_buses.get(queue_id)
+        withdrew = program_bus is not None and program_bus.cancel(
+            label, reason, start_frame=start_frame
+        )
+        marked = self._program_ledger.mark_dropped(queue_id, label, reason, start_frame=start_frame)
+        return withdrew or marked
+
+    def cancel_overlays(
+        self,
+        queue_id: str,
+        reason: str,
+        *,
+        kinds: frozenset[ProgramKind] | None = None,
+        origin: str | None = None,
+    ) -> None:
+        """
+        Drop the programs that are still to be heard on the queue's flow stream.
+
+        Runs synchronously: the queue must be able to move on at once, and what was
+        cancelled is never made up for later.
+
+        :param queue_id: Queue whose programs are dropped.
+        :param reason: Why they are dropped, from the vocabulary of ScheduleReason, for the
+            ledger.
+        :param kinds: Only the programs of these kinds are dropped; None drops every kind.
+        :param origin: What asked for it, only for the log: the ledger keeps the reason, and
+            a jump in the queue names the command that caused it here instead.
+        """
+        if origin is not None:
+            self.logger.debug(
+                "PROGRAM-BUS dropping the programs of queue %s that are not going to be "
+                "heard (%s asked, %s)",
+                queue_id,
+                origin,
+                reason,
+            )
+        self._program_ledger.refresh(queue_id, self._heard_frames(queue_id))
+        if kinds is None and (program_bus := self._program_buses.get(queue_id)) is not None:
+            # a collective abort stops whatever the bus still has, even a program the ledger
+            # no longer lists; a filtered one cancels each of its programs by its own anchor
+            program_bus.cancel_all(reason)
+        self._program_ledger.drop_queue(queue_id, reason, kinds=kinds)
+
+    def cancel_overlays_of_a_jump(
+        self, queue_id: str, reason: str, *, origin: str | None = None
+    ) -> None:
+        """
+        Drop what a jump in the queue leaves behind, keeping the announcements.
+
+        A move of the queue (next, previous, skip, a play of another item) leaves every
+        program behind that was written for a boundary it will not reach or that was meant
+        for the moment it left, so those end as dropped with the given reason. An
+        announcement is not one of them: it is heard over the stream, and the audio that was
+        already rendered is anchored again on the bus the jump opens (its retention listens
+        for that). A clip the listener was already hearing ends as aired instead, because
+        the jump cuts it and it is not spoken a second time.
+
+        :param queue_id: Queue that moved.
+        :param reason: Why the programs are dropped, from the vocabulary of ScheduleReason
+            (``skipped`` for another item, ``seeked`` for a jump within the one playing).
+        :param origin: The command that moved the queue, only for the log.
+        """
+        self.cancel_overlays(queue_id, reason, kinds=KINDS_A_JUMP_DROPS, origin=origin)
+
+    def on_queue_removed(self, queue_id: str) -> None:
+        """
+        Forget what the streams controller kept for a queue that is gone.
+
+        The bus registry, the ledger and the fallback report are per queue. A player that
+        disappears takes its queue with it, and a queue created again under the same id has
+        to start empty instead of reading what the one before it left behind. A bus that is
+        still published is ended first, so the programs it had are dropped on it rather than
+        left scheduled for a queue that is gone.
+
+        :param queue_id: Queue that was removed.
+        """
+        self._program_buses.forget_queue(queue_id)
+        self._program_ledger.forget_queue(queue_id)
+        self._overlays_without_position.discard(queue_id)
+
+    @api_command("streams/overlay_state", required_scope=Scope.QUEUES_READ)
+    def overlay_state(self, queue_id: str) -> list[OverlayState]:
+        """
+        Return the programs the queue's stream recently placed, aired, dropped or lost.
+
+        The answer comes from the controller's own ledger of the queue, never from the live
+        bus: a program that left the bus keeps the state it ended in, and no program audio is
+        part of the answer.
+
+        :param queue_id: Queue whose ledger to read.
+        """
+        return self._program_ledger.states(queue_id, self._heard_frames(queue_id))
+
+    @api_command("streams/program_bus", required_scope=Scope.QUEUES_READ)
+    def program_bus(self, queue_id: str) -> ProgramBusView:
+        """
+        Return what the queue's program bus is doing, for the audio path's details.
+
+        The answer describes the bus and the programs on it; no program audio is part of it
+        and no program can be started, moved or stopped through it. Labels are shortened, so
+        a program name is never a way to read a prompt back out of the server.
+
+        :param queue_id: Queue whose bus to describe.
+        """
+        program_bus = self._program_buses.get(queue_id)
+        # one position for the whole answer: a second read could already have moved on
+        position = None if program_bus is None else self._audible_frame(queue_id, program_bus)
+        return build_program_bus_view(
+            enabled=self.program_bus_enabled(),
+            queue_id=queue_id,
+            ledger=self._program_ledger,
+            program_bus=program_bus,
+            claims=ProgramBusClaims(
+                flow=self.flow_mode_required(queue_id),
+                boundary=self.boundary_mix_required(queue_id),
+            ),
+            position=position,
+        )
 
     async def get_config_entries(self) -> tuple[ConfigEntry, ...]:
         """Return all Config Entries for this core module (if any)."""
@@ -628,6 +1075,12 @@ class StreamsController(CoreController):
             CONF_ENTRY_VOLUME_NORMALIZATION_TARGET,
             ConfigEntry(
                 key=CONF_ALLOW_CROSSFADE_SAME_ALBUM,
+                type=ConfigEntryType.BOOLEAN,
+                default_value=False,
+                category="playback",
+            ),
+            ConfigEntry(
+                key=CONF_STREAM_PROGRAM_BUS,
                 type=ConfigEntryType.BOOLEAN,
                 default_value=False,
                 category="playback",
@@ -1564,6 +2017,10 @@ class StreamsController(CoreController):
             else CrossfadeMode.DISABLED
         )
         mix_overlay = overlay_mixed_in(queue, start_queue_item, flow_mode=True)
+        # a session that may mix programs sums a voice over the music, which only holds up
+        # in float: the choice is made for the whole session, as a depth change would
+        # restart the stream (it applies from the next play start)
+        mix_programs = self.program_bus_enabled()
         flow_pcm_format = await self.audio.select_flow_pcm_format(
             player,
             start_streamdetails=start_queue_item.streamdetails,
@@ -1576,7 +2033,7 @@ class StreamsController(CoreController):
                 start_queue_item.streamdetails is not None
                 and start_queue_item.streamdetails.tail_overlap is not None
             ),
-            overlay_active=mix_overlay,
+            overlay_active=mix_overlay or mix_programs,
         )
 
         # work out output format/details
@@ -2567,6 +3024,78 @@ class StreamsController(CoreController):
             return False
         return announce_player.get_config_value(CONF_REQUIRES_FIXED_CONTENT_LENGTH, False)
 
+    def _audible_frame(self, queue_id: str, program_bus: FlowProgramBus) -> int | None:
+        """
+        Return the frame of the queue's stream the listener has reached, if it can be told.
+
+        The player reports how much of the stream it played. What the session produced beyond
+        that is the audio buffered between the two, which reaches the player on its own, so it
+        is not part of the lead a program still needs. A position from a clock that is not this
+        stream's (an item's own position, or a stream that has since been replaced) says nothing
+        about that buffer, so it is not used - in either direction, since a position ahead of
+        what this session produced is no more a reading of it than one far behind.
+
+        :param queue_id: Queue whose stream is being mixed into.
+        :param program_bus: The queue's live program bus, counting the produced frames.
+        """
+        player = self.mass.players.get_player(queue_id)
+        if player is None or player.state.playback_state not in (
+            PlaybackState.PLAYING,
+            PlaybackState.PAUSED,
+        ):
+            return None
+        if (heard := player.state.corrected_elapsed_time) is None:
+            return None
+        rate = program_bus.pcm_format.sample_rate
+        lead_frames = int(MAX_BUFFERED_LEAD_SECONDS * rate)
+        frame = int(heard * rate)
+        if frame - program_bus.produced_frames > lead_frames:
+            # a position further ahead than a whole lead is no position of this session: the
+            # bus was replaced and the player still reports where the previous one was, or
+            # the position is an item's own. Clamping it to the produced end would turn that
+            # into the producer's edge and place a program on a boundary nobody reached
+            return None
+        # a report that overshoots the produced end by a step is the producer's edge
+        frame = min(frame, program_bus.produced_frames)
+        if program_bus.produced_frames - frame > lead_frames:
+            return None
+        return frame
+
+    def _overlay_was_dropped(
+        self, queue_id: str, label: str, start_frame: int, reason: str
+    ) -> None:
+        """Stop the program the ledger dropped from still being heard on the queue's bus."""
+        self.cancel_overlay(queue_id, label, reason, start_frame=start_frame)
+
+    def _overlay_was_aired(self, queue_id: str, label: str, _start_frame: int) -> None:
+        """Tell the listeners that a program was heard to its end."""
+        for listener in list(self._program_aired_listeners):
+            try:
+                listener(queue_id, label)
+            except Exception:
+                self.logger.exception(
+                    "A program aired listener failed for queue %s (%s)", queue_id, label
+                )
+
+    def _heard_frames(self, queue_id: str) -> Callable[[FlowProgramBus], int | None]:
+        """Return a reader for the frame the queue's listener has heard on a bus."""
+
+        def _heard(program_bus: FlowProgramBus) -> int | None:
+            player = self.mass.players.get_player(queue_id)
+            if player is not None and player.state.playback_state is PlaybackState.PAUSED:
+                # a pause stops the stream time: a deadline in the future stays where it is
+                return None
+            return self._audible_frame(queue_id, program_bus)
+
+        return _heard
+
+    def _report_no_position(self, queue_id: str, label: str, message: str, seconds: float) -> None:
+        """Log a program that had to do without a heard position, once per queue."""
+        if queue_id in self._overlays_without_position:
+            return
+        self._overlays_without_position.add(queue_id)
+        self.logger.debug(message, queue_id, label, seconds)
+
     def _get_flow_start_item(self, queue: PlayerQueue, queue_item_id: str) -> QueueItem | None:
         """
         Return the item a flow stream of the queue's current session starts at.
@@ -2801,6 +3330,12 @@ class StreamsController(CoreController):
         :param protocol_player: The player (protocol) that will render the stream.
         """
         if self.flow_mode_required(queue_id):
+            return True
+        if self.lead_hold_required(queue_id):
+            # a lead starts before the item it belongs to ends, so only the flow stream can
+            # mix it: a gapless player would simply switch items and never reach that audio.
+            # A running stream is not restarted for this, so the first boundary after the
+            # claim is raised finds no held tail and airs without a lead
             return True
         # mixed boundaries only need flow mode on a player that cannot play gapless
         return (
