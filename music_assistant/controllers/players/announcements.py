@@ -733,8 +733,9 @@ class AnnouncementsMixin(_PlayerControllerBase):
                 player.name,
                 prev_media_name,
             )
-            # Stop the queue (not just the device) so resume_pos is saved.
-            # _handle_stop skips the user permission check on this internal path.
+            # Stop the queue (not just the device) so resume_pos is saved and the queue parks
+            # at it for the clip's length. _handle_stop skips the user permission check on
+            # this internal path.
             if active_queue := self.get_active_queue(player):
                 await self.mass.player_queues._handle_stop(active_queue.queue_id)
             else:
