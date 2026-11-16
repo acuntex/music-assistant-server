@@ -177,6 +177,9 @@ class PlayerController(
 
     async def close(self) -> None:
         """Cleanup on exit."""
+        retention = getattr(self, "_announcement_retention", None)
+        if retention is not None:
+            retention.close()
         if self._poll_task and not self._poll_task.done():
             self._poll_task.cancel()
         # Cancel all pending protocol evaluations

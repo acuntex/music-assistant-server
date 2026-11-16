@@ -70,7 +70,12 @@ PLAYLIST_MEDIA_TYPES: Final[tuple[MediaType, ...]] = (
 # a new enum value or error code, a change in what an existing field holds, or a command that
 # only the bundled frontend uses: the frontend ships in lockstep with the server and never
 # gates on this.
-API_SCHEMA_VERSION: Final[int] = 116
+#
+# 117 is the first version that carries this branch: upstream's own bump stopped at 116, and the
+# new parameter on players/play_announcement(mode=...) is what a client that is not bundled with
+# the server has to gate on — the Home Assistant integration calls that command. The streams
+# commands the feature adds are read by the bundled frontend only, so they carry no bump.
+API_SCHEMA_VERSION: Final[int] = 117
 
 # MIN_SCHEMA_VERSION is the minimum API schema version that the current server
 # version can work with. Only bump when there are breaking changes to existing

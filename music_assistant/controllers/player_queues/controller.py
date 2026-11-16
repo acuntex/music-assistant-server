@@ -1777,6 +1777,7 @@ class PlayerQueuesController(QueueLoaderMixin, PlaybackTrackerMixin, StreamFeede
         :param permanent: Also delete the queue's persisted state and items.
         """
         self.mass.streams.audio_processing.clear(player_id)
+        self.mass.players.on_queue_removed(player_id)
         self._cancel_pending_playback(player_id)
         # cancel a pending debounced cache write AND an already-started one, so neither can
         # recreate a deleted entry after the player is gone (the timer becomes a task once it fires)
