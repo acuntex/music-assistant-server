@@ -1730,7 +1730,8 @@ async def test_flow_source_error_skips_item_without_completing_it() -> None:
     audio = StreamsAudio(cast("Any", mass))
 
     async def _failed_stream(*_args: object, **_kwargs: object) -> AsyncGenerator[bytes]:
-        yield b"buffered audio"
+        # a whole number of frames, as the decoder emits them: the bus drops a residue
+        yield b"buffered audio!!"
         streamdetails.stream_error = True
 
     audio.get_queue_item_stream = _failed_stream  # type: ignore[method-assign]
@@ -1752,7 +1753,7 @@ async def test_flow_source_error_skips_item_without_completing_it() -> None:
 
     chunks = [chunk async for chunk in stream]
 
-    assert chunks == [b"buffered audio"]
+    assert chunks == [b"buffered audio!!"]
     # the flow ran to natural completion (next item lookup raised QueueEmpty)
     mass.player_queues.queue_buffer_completed.assert_called_once()
     # the play log entry is kept, honest about the partial amount actually sent
@@ -2255,6 +2256,8 @@ def _native_stream_handler_context(
     audio.get_player_output_plan.side_effect = _OutputPlanRequested
 
     controller = cast("Any", object.__new__(StreamsController))
+    controller.config = MagicMock()
+    controller.config.get_value.return_value = False
     controller._open_item_streams = {}
     controller._ended_item_streams = {}
     controller.mass = mass
@@ -2265,6 +2268,7 @@ def _native_stream_handler_context(
     controller._active_output_streams = 0
     controller._flow_mode_owners = {}
     controller._boundary_mix_owners = {}
+    controller._lead_hold_owners = {}
 
     response = MagicMock()
     response.prepare = AsyncMock()

@@ -2190,10 +2190,15 @@ def _single_item_handler(
     audio.select_pcm_format = _select_pcm_format
     audio.fade_into_pending = MagicMock(return_value=False)
     controller = cast("Any", object.__new__(StreamsController))
+    controller.config = MagicMock()
+    controller.config.get_value.return_value = False
     controller.mass = mass
     controller.audio = audio
     controller._open_item_streams = {}
     controller._ended_item_streams = {}
+    controller._flow_mode_owners = {}
+    controller._boundary_mix_owners = {}
+    controller._lead_hold_owners = {}
     controller.logger = MagicMock()
     controller._log_request = MagicMock()
     controller.get_crossfade_mode = MagicMock(return_value=CrossfadeMode.SMART_CROSSFADE)
@@ -2374,6 +2379,8 @@ def _flow_handler(
     audio.get_player_output_plan = MagicMock(return_value=SimpleNamespace(filter_params=[]))
 
     controller = cast("Any", object.__new__(StreamsController))
+    controller.config = MagicMock()
+    controller.config.get_value.return_value = False
     controller.mass = mass
     controller.audio = audio
     controller.logger = MagicMock()
@@ -2383,6 +2390,7 @@ def _flow_handler(
     controller._active_output_streams = 0
     controller._flow_mode_owners = {}
     controller._boundary_mix_owners = {}
+    controller._lead_hold_owners = {}
     controller.get_crossfade_mode = MagicMock(return_value=CrossfadeMode.DISABLED)
 
     seen: dict[str, Any] = {}
@@ -2557,6 +2565,7 @@ async def test_single_item_handler_ends_a_failed_stream_instead_of_raising(
     controller._active_output_streams = 0
     controller._flow_mode_owners = {}
     controller._boundary_mix_owners = {}
+    controller._lead_hold_owners = {}
 
     async def _failing_stream(**_kwargs: Any) -> AsyncGenerator[bytes]:
         yield b"\x01" * 64
