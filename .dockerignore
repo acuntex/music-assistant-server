@@ -1,0 +1,13 @@
+# Only the server tree and the built frontend bundle are copied in; everything
+# else (git metadata, sources, node_modules, the checkout's own tooling) would
+# only make the context bigger.
+.git
+.venv
+frontend/.git
+frontend/node_modules
+frontend/src
+frontend/tests
+frontend/public
+frontend/docs
+frontend/scripts
+frontend/.github
