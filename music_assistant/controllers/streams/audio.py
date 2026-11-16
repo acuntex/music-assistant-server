@@ -383,6 +383,24 @@ def tail_hold_target(queue_item: QueueItem, max_bytes: int, frame_size: int) -> 
     return max_bytes // frame_size * frame_size
 
 
+def delivered_media_covers_item(streamdetails: StreamDetails, delivered_seconds: float) -> bool:
+    """
+    Return whether what a source or the flow delivered may stand in for the item's length.
+
+    A source that loses its session (another stream taking its slot, a provider
+    session that moved on) ends in a clean EOF mid-item, exactly like the item
+    ending. What was delivered is then shorter than the item itself, and that
+    shortfall is not the item's length: it would make the queue play the item as
+    that much shorter next time. Only a delivered length that reaches the item's
+    own media-time confirms or extends it.
+
+    :param streamdetails: The item's stream details, still holding its own length.
+    :param delivered_seconds: Media-time delivered for the item, from where it started.
+    """
+    declared = streamdetails.duration or 0
+    return not declared or delivered_seconds >= declared
+
+
 async def _incoming_overlap_stream(
     collected: bytes,
     stream: AsyncGenerator[bytes],
@@ -2652,12 +2670,14 @@ class StreamsAudio:
             uncredited_tail_seconds = uncredited_tail_bytes / pcm_format.pcm_sample_size
             # streamdetails.duration is in media-time; seconds_streamed is stream-time
             # (post-atempo), so we scale by playback_speed to recover media-time.
-            streamdetails.duration = int(
+            written_seconds = (
                 streamdetails.seek_position
                 + (seconds_streamed + uncredited_tail_seconds) * playback_speed
             )
-            # propagate accurate duration to queue_item so UI displays it
-            queue_item.duration = streamdetails.duration
+            if delivered_media_covers_item(streamdetails, written_seconds):
+                streamdetails.duration = int(written_seconds)
+                # propagate accurate duration to queue_item so UI displays it
+                queue_item.duration = streamdetails.duration
         self.logger.debug(
             "Finished Streaming queue track: %s (%s) on queue %s "
             "- crossfade data prepared for next track: %s",
@@ -3391,13 +3411,15 @@ class StreamsAudio:
                     # streamdetails.duration is in media-time; seconds_streamed is stream-time
                     # (post-atempo), so we scale by the track's playback_speed to recover media-time.
                     assert play_log_entry.seek_position is not None
-                    queue_track.streamdetails.duration = int(
+                    written_seconds = (
                         play_log_entry.seek_position
                         + (seconds_streamed + tail_seconds) * track_playback_speed
                     )
-                    # propagate accurate duration to queue_item so UI displays it
-                    queue_track.duration = queue_track.streamdetails.duration
-                    play_log_entry.duration = queue_track.streamdetails.duration
+                    if delivered_media_covers_item(queue_track.streamdetails, written_seconds):
+                        queue_track.streamdetails.duration = int(written_seconds)
+                        # propagate accurate duration to queue_item so UI displays it
+                        queue_track.duration = queue_track.streamdetails.duration
+                        play_log_entry.duration = queue_track.streamdetails.duration
                 if last_play_log_entry is play_log_entry and last_fadeout_part:
                     # Pre-count the full crossfade tail so the queue index calculation
                     # doesn't undercount while waiting for the next track's crossfade mix.
@@ -5112,7 +5134,12 @@ class StreamsAudio:
             seconds_received = bytes_sent / pcm_format.pcm_sample_size if bytes_sent else 0
             # store accurate duration, but only for a playthrough from the very start:
             # a seeked stream yields the remaining audio, not the item's full length
-            if finished and not requested_seek_position and seconds_received:
+            if (
+                finished
+                and not requested_seek_position
+                and seconds_received
+                and delivered_media_covers_item(streamdetails, seconds_received)
+            ):
                 streamdetails.duration = int(seconds_received)
 
             logger.log(
