@@ -126,6 +126,7 @@ from music_assistant.controllers.streams.constants import (
     VOICE_OVER_RAMP,
 )
 from music_assistant.controllers.streams.ogg_handler import get_chained_ogg_stream
+from music_assistant.controllers.streams.program_mixer import FlowProgramBus
 from music_assistant.controllers.streams.smart_fades import SmartFadesMixer
 from music_assistant.controllers.streams.smart_fades.fades import SmartFade, StandardCrossFade
 from music_assistant.controllers.streams.smart_fades.helpers import SMART_CROSSFADE_DURATION
@@ -209,6 +210,12 @@ if TYPE_CHECKING:
     from music_assistant.mass import MusicAssistant
     from music_assistant.models.player_protocol import PlayerProtocol
     from music_assistant.models.provider import Provider
+
+# the program bus lives in its own module; the rest of the streams controller and its tests
+# still take it from here, so the import path stays one
+__all__ = [
+    "FlowProgramBus",
+]
 
 # ruff: noqa: PLR0915
 
