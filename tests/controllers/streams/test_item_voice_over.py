@@ -14,9 +14,13 @@ from music_assistant_models.enums import CrossfadeMode, MediaType
 from music_assistant_models.errors import QueueEmpty
 from music_assistant_models.streamdetails import TailOverlap
 
+from music_assistant.controllers.players.announcements import ANNOUNCEMENT_MODE_OVERLAY
 from music_assistant.controllers.streams.audio import CrossfadeHandover, StreamsAudio
 from music_assistant.controllers.streams.constants import MIN_VOICE_OVER_DURATION, VOICE_OVER_RAMP
 from music_assistant.models.music_provider import ProviderStreamLimitError
+from tests.controllers.players.test_overlay_announcement import (
+    _Harness as _AnnouncementHarness,
+)
 from tests.controllers.streams.test_crossfade_transition import (
     STANDARD_CROSSFADE_DURATION,
     TEST_PCM_FORMAT,
@@ -565,3 +569,75 @@ async def test_a_track_with_a_declared_lead_gets_the_clip_mixed_over_its_tail(
 
     assert clip.streamdetails.seek_position == lead
     assert len(clip_output) == (CLIP_SECONDS - lead) * SAMPLE_SIZE
+
+
+async def test_a_player_without_flow_mode_plays_the_clip_as_an_item_and_announces_on_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    The non-flow player keeps its old path: item streams, no voice over, device announcements.
+
+    Such a player plays every item on its own request, so its clips are plain items of the
+    queue and a declared overlap is not mixed into their boundary. An announcement asked to
+    ride the stream has no stream to ride and is played on the device instead.
+    """
+    # the route: no gapless, no crossfade, so the clip is served as its own item
+    controller, request, seen = _single_item_handler(is_realtime=False, capture_ffmpeg=monkeypatch)
+    _declare_clip(controller)
+    controller.get_crossfade_mode.return_value = CrossfadeMode.DISABLED
+    protocol = controller.mass.players.get_output_protocol.return_value
+    protocol.flow_mode = False
+    protocol.supported_features = set()
+
+    with pytest.raises(_FfmpegArgsCaptured):
+        await controller.serve_queue_item_stream(request)
+
+    assert seen["crossfade_enabled"] is False
+    controller.audio.get_queue_item_stream_with_smartfade.assert_not_called()
+    controller.audio.get_queue_item_stream.assert_called_once()
+    assert any(
+        call.args[0] == "Ignoring the tail overlap of %s: player %s does not play gapless"
+        for call in controller.logger.debug.call_args_list
+    )
+
+    # the audio: both items are served whole and nothing is mixed between them
+    clip = _clip()
+    track = _declared_track()
+    audio, _mass = _item_audio(monkeypatch, next_item=track, load_next=[track, QueueEmpty])
+    opened = _install_item_streams(monkeypatch, audio)
+
+    async def _item_run(item: SimpleNamespace) -> bytes:
+        return await _drain(
+            audio.get_queue_item_stream(
+                cast("Any", item),
+                pcm_format=TEST_PCM_FORMAT,
+                seek_position=0,
+                playback_speed=1.0,
+                raise_on_error=False,
+                session_id="session-1",
+            )
+        )
+
+    clip_output = await _item_run(clip)
+    track_output = await _item_run(track)
+
+    assert clip_output == bytes([CLIP_MARKER]) * CLIP_SECONDS * SAMPLE_SIZE
+    assert track_output == bytes([TRACK_MARKER]) * TRACK_SECONDS * SAMPLE_SIZE
+    cast("Any", audio.smart_fades_mixer.build).assert_not_awaited()
+    assert audio._crossfade_handover == {}
+    assert audio._crossfade_pending == {}
+    assert clip.streamdetails.seek_position == 0
+    assert track.streamdetails.seek_position == 0
+    assert opened == [("item-1", 0), ("item-2", 0)]
+
+    # the announcement: an overlay has no flow stream to ride, so the device plays it
+    mock_mass = MagicMock()
+    mock_mass.closing = False
+    mock_mass.config.get_raw_core_config_value = MagicMock(return_value="GLOBAL")
+    mock_mass.config.get_raw_player_config_value = MagicMock(return_value=None)
+    announcement = _AnnouncementHarness(mock_mass, flow_mode=False)
+
+    await announcement.announce(mode=ANNOUNCEMENT_MODE_OVERLAY)
+
+    assert announcement.scheduled() is False
+    announcement.device_play.assert_awaited_once()

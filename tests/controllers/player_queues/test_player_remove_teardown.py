@@ -69,6 +69,8 @@ def test_removal_cancels_the_pending_next_track_work() -> None:
 
     ctrl.on_player_remove(QUEUE_ID, permanent=False)
 
+    ctrl.mass.players.on_queue_removed.assert_called_once_with(QUEUE_ID)
+
     cancelled_tasks = {call.args[0] for call in mass.cancel_task.call_args_list}
     cancelled_timers = {call.args[0] for call in mass.cancel_timer.call_args_list}
     assert {

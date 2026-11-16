@@ -2648,11 +2648,13 @@ class TestReleaseWaitForPlayMedia:
         controller._handle_cmd_stop = _release  # type: ignore[method-assign]
 
     @classmethod
-    async def _play_media(cls, controller: PlayerController, events: list[str]) -> None:
+    async def _play_media(cls, controller: PlayerController, events: list[str]) -> float:
         """
         Play on the member, and add the play and the end of the wait to the events.
 
         The end of the wait is "bound", the time twice as long "twice the bound".
+
+        :return: How many seconds the play_media call waited before the play went out.
         """
         loop = asyncio.get_running_loop()
 
@@ -2664,11 +2666,13 @@ class TestReleaseWaitForPlayMedia:
             loop.call_later(cls.BOUND, events.append, "bound"),
             loop.call_later(2 * cls.BOUND, events.append, "twice the bound"),
         ]
+        start = loop.time()
         try:
             await controller.play_media("member", MagicMock(uri="x", source_id="src"))
         finally:
             for marker in markers:
                 marker.cancel()
+        return loop.time() - start
 
     @pytest.mark.parametrize("capture", ["synced", "dynamic", "static"])
     async def test_plays_as_soon_as_the_player_reports_its_leave(
@@ -2691,12 +2695,16 @@ class TestReleaseWaitForPlayMedia:
     ) -> None:
         """A leave reported as late as a Sonos speaker reports it through its own event."""
         controller, owner, member = self._captured_member(mock_mass, capture)
+        late = 6.7
         events: list[str] = []
-        self._confirm_release_after(controller, owner, member, 6.7, events)
+        self._confirm_release_after(controller, owner, member, late, events)
 
-        await self._play_media(controller, events)
+        elapsed = await self._play_media(controller, events)
 
+        # the play went out because the leave was reported, not because the wait ran out:
+        # the bound alone would have let it go out before the leave ever arrived
         assert events == ["left", "play on member"]
+        assert elapsed >= late
         assert member.synced_to is None
         assert member.active_group is None
         # the bound of the server outlasts it
