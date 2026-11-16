@@ -7,14 +7,24 @@ from typing import Any
 from music_assistant_models.enums import ContentType
 from music_assistant_models.media_items import AudioFormat
 
+from music_assistant.controllers.streams.constants import (
+    MAX_LEAD_OVERLAP,
+    MIN_VOICE_OVER_DURATION,
+    PRE_OVERLAP_ATTR,
+    PRE_OVERLAP_FROM_ATTR,
+)
+
 CONF_AI_ENGINE = "ai_engine"
 CONF_TTS_ENGINE = "tts_engine"
 CONF_TTS_LOUDNESS_BOOST = "tts_loudness_boost"
+CONF_PLAY_INTRO_ON_ACTIVATE = "play_intro_on_activate"
 CONF_TIMEZONE = "timezone"
 CONF_WEATHER_CITY = "weather_city"
 CONF_WEATHER_COUNTRY = "weather_country"
 CONF_WEATHER_PROVIDER = "weather_provider"
 CONF_WEATHER_TIMEOUT = "weather_timeout_seconds"
+# set once every persisted queue was checked for the DJ clips an older release spliced in
+CONF_LEGACY_DJ_ITEMS_CLEANED = "legacy_dj_items_cleaned"
 
 # providers load concurrently, so the plugin supplying the engines may still be
 # loading when AI Radio initializes: wait this long for it before giving up
@@ -99,13 +109,49 @@ AI_QUERY_TIMEOUT_SECONDS = 180
 # ffprobe reports no status code, so its message is all we have to spot a failed render
 TTS_SERVER_ERROR_MARKERS = ("Server returned 5XX", "HTTP error 5")
 
-# a session whose renders (an AI query or a TTS call) fail this many times in a row stops
-# asking the engines for RENDER_COOLDOWN_SECONDS: an engine that is out of quota or down
-# fails every clip, and each attempt costs a request against that same quota
+# a session whose renders fail this many times in a row stops asking that engine for a
+# while: an engine that is out of quota or down fails every clip, and each attempt costs a
+# request against that same quota. The AI query and the voice fail for different reasons and
+# recover on their own, so each keeps its own count and its own pause
 RENDER_FAILURES_BEFORE_COOLDOWN = 3
-RENDER_COOLDOWN_SECONDS = 15 * 60
+AI_COOLDOWN_SECONDS = 15 * 60
+# the pre-term render code still reads one engine-independent cool-down; it goes with the
+# render rewrite that counts each engine on its own
+RENDER_COOLDOWN_SECONDS = AI_COOLDOWN_SECONDS
+TTS_COOLDOWN_SECONDS = 5 * 60
 
 DEFAULT_TTS_LOUDNESS_BOOST = 3
+
+# a DJ switched on speaks an intro the moment it airs, unless that is switched off
+DEFAULT_PLAY_INTRO_ON_ACTIVATE = True
+
+# a host opens and closes the queue it speaks over unless its own switch says otherwise; the
+# default keeps a host stored before the switches existed speaking both
+HOST_SWITCH_DEFAULT = True
+
+# a program mixed into the queue's stream is scheduled by its label, so a re-plan can tell
+# the intro from a break and the log names what was heard
+OVERLAY_LABEL_INTRO = "AI DJ intro"
+OVERLAY_LABEL_TRANSITION = "AI DJ transition"
+
+# A DJ armed while the experimental program bus is off speaks nothing, because a queue's
+# stream only mixes programs with that switch on. Arming is never refused for it: the client
+# shows what is missing, with the way to the core streams settings where the switch lives.
+PROGRAM_BUS_OFF_HINT = (
+    "The AI DJ is set, but the stream program bus is switched off, so it stays silent. "
+    "Switch the program bus on in the core stream settings."
+)
+PROGRAM_BUS_OFF_LINK = "/settings/editcore/streams"
+
+# breaks are held back while the intro renders, so it can not be talked over; an engine
+# that hangs must not hold them back for the rest of the session
+INTRO_RENDER_TIMEOUT_SECONDS = 60
+
+# an intro that is owed because its queue had not started yet is looked for again this
+# often, this many times: the flow session that carries it opens seconds after playback
+# starts, without a queue event of its own
+INTRO_RETRY_SECONDS = 5.0
+INTRO_PENDING_LOOKS = 3
 
 # speech carries ~16 dB between its average level and its peaks, so a plain gain that
 # reaches the target clips instead. speechnorm evens the clip out so the level is carried
@@ -158,6 +204,32 @@ ATTR_WEATHER_REQUIRED = "ai_radio_weather_required"
 # per-section opt-in: a break from a section that allows it may carry its tail over the
 # next record's intro (a "post")
 ATTR_ALLOW_POST = "ai_radio_allow_post"
+# per-section opt-in: a break from a section that allows it may start over the running
+# record's tail (a "pre"). Together with a post the break straddles the boundary.
+ATTR_ALLOW_PRE = "ai_radio_allow_pre"
+# seconds of the break that play before the boundary, published on the clip for the streams;
+# the keys and the ceilings are shared with the stream controller, so a change cannot drift
+ATTR_PRE_OVERLAP = PRE_OVERLAP_ATTR
+ATTR_PRE_FROM = PRE_OVERLAP_FROM_ATTR
+TALK_OVER_MAX_PRE = MAX_LEAD_OVERLAP
+MIN_PRE_SECONDS = MIN_VOICE_OVER_DURATION
+
+# how far a break may start before its boundary is the host's call: the section only allows
+# a pre, the host owns the seconds. 0 means the break starts at the track's end, and the
+# ceiling is the same lead the item path can show
+TERM_HEAD_MIN_SECONDS = 0.0
+TERM_HEAD_MAX_SECONDS = TALK_OVER_MAX_PRE
+TERM_HEAD_DEFAULT_SECONDS = 2.0
+
+# the ceiling on one spoken contribution: the section's character limit decides how long the
+# host talks and a runaway script can turn a break into a monologue, so a rendered
+# contribution longer than the host allows is cut (after the render, so the delivery stays)
+MAX_CONTRIBUTION_MIN_SECONDS = 15.0
+MAX_CONTRIBUTION_MAX_SECONDS = 90.0
+MAX_CONTRIBUTION_DEFAULT_SECONDS = 45.0
+# a contribution is faded out over this long before the cut, so the ceiling is heard as an
+# end instead of as a step in the middle of a word
+CONTRIBUTION_FADE_SECONDS = 0.05
 
 # A post plays the last `overlap` seconds of a break over the next record's intro, with the
 # record ducked under the voice. With a break of B seconds and W seconds of intro before the

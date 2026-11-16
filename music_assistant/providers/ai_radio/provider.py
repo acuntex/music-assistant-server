@@ -46,8 +46,10 @@ from .constants import (
     TRANSLATION_OWNER,
 )
 from .hosts import AIRadioHostsMixin
+from .intro import AIRadioIntroMixin
 from .media import AIRadioMediaMixin
 from .models import DJQueueState
+from .queue_audio import QueueAudioLevels
 from .queue_dj import AIRadioQueueDJMixin
 from .rendering import AIRadioRenderMixin
 from .runtime import AIRadioRuntimeMixin
@@ -73,6 +75,7 @@ class AIRadioProvider(
     AIRadioRuntimeMixin,
     AIRadioRenderMixin,
     AIRadioHostsMixin,
+    AIRadioIntroMixin,
     AIRadioQueueDJMixin,
     AIRadioStorageMixin,
     AIRadioMediaMixin,
@@ -97,6 +100,9 @@ class AIRadioProvider(
         self._sections: dict[str, dict[str, Any]] = {}
         self._hosts: dict[str, dict[str, Any]] = {}
         self._dj_queues: dict[str, DJQueueState] = {}
+        # queue_id -> the level the queue was set to, kept across an arm the user did not
+        # ask for (a show detaching, a host switched) so a re-armed DJ speaks at it again
+        self._queue_levels: dict[str, QueueAudioLevels] = {}
         self._dj_lock = asyncio.Lock()
         # queue_id -> station_id for a show DJ armed this play: keeps a manual disable mid-show
         # final and, on detach, lets a replay of the ended queue re-arm cleanly
