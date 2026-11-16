@@ -235,7 +235,11 @@ Smart fades mix the outgoing track's held-back tail (up to 45 seconds) with the 
 - `STANDARD_CROSSFADE`: `StandardCrossFade`, a fixed-length overlap after stripping trailing silence
 - `VOICE_OVER`: `VoiceOverFade`, a declared transition that plays as declared and is never planned
 
-An item that declares a tail overlap (`StreamDetails.tail_overlap`) plays it as `VOICE_OVER` into the item it was planned against, whatever the queue's crossfade setting: on the flow stream, and per item on a player that plays gapless, where the incoming item's request takes the smart fade stream to pick the mix up. A direct PCM stream of a single item never mixes its boundary. A plugin about to queue such items asks for the queue's boundaries to be mixed with `set_boundary_mix_required`; at each play start the controller then puts only a player whose selected output protocol cannot play gapless in flow mode.
+An item that declares a tail overlap (`StreamDetails.tail_overlap`) plays it as `VOICE_OVER` into the item it was planned against, whatever the queue's crossfade setting: on the flow stream, and per item on a player that plays gapless, where the incoming item's request takes the smart fade stream to pick the mix up. A direct PCM stream of a single item never mixes its boundary. A plugin about to queue such items asks for the queue's boundaries to be mixed with `set_boundary_mix_required`; at each play start the controller then puts only a player whose selected output protocol cannot play gapless in flow mode. A plugin whose clip may start before the item it belongs to ends (a lead) additionally asks for the item's tail to be held with `set_lead_hold_required`: the flow then keeps up to `LEAD_HOLD_CEILING` of each track back instead of one crossfade, which only that lead needs - a queue that merely mixes its boundaries holds its tail with the crossfade.
+
+Which claims a queue's item path holds follows the host of the DJ armed on it: a host whose sections may straddle a boundary (`allow_post`) or start over the outgoing tail (`allow_pre`) claims the boundary mix, and `allow_pre` additionally claims the held tail, so a clip that begins before its successor also finds a tail to talk over when the program bus is switched off. Both are placed whenever a DJ is armed or restored, whichever side of the switch is on. `dev` did neither for the item path: it claimed a boundary mix only for a show's host and only on `allow_post`, and it had no held tail at all, so an `allow_pre` break found nothing to talk over and sounded cut at the boundary. The frozen flag-off streams therefore pin this branch, not `dev`: flag off is `dev` plus that repair.
+
+A second deviation, and one that has nothing to do with the switch, is `delivered_media_covers_item` (in `audio.py`), which decides whether a delivered length may stand in for an item's own. `dev` wrote `streamdetails.duration = int(written_seconds)` after every pass; here the item's duration is only confirmed or extended when what was delivered reaches the length the item declares, and that holds on the item path too - the flow's end-of-track writeback, the play log entry, and the direct PCM stream of a single item. A source that loses its session (another stream taking its slot, a provider session that moved on) ends in a clean EOF mid-item, and that shortfall is not the item's length: without the guard a single aborted play shortens the item for every play after it. This one is not the bus's at all, so it will be split out as its own `fix(streams):` change against `dev`, while the frozen flag-off streams pin it here with the rest.
 
 A smart crossfade falls back to the standard crossfade when a track has no analysis row with BPM and beats, when the planner raises `SmartFadeNotApplicable` (the held-back tail falls silent within its first 8 seconds, or no candidate fits), or when the build fails.
 
@@ -286,6 +290,174 @@ python -m scripts.smart_fades_replay \
     --library-db ~/.musicassistant/library.db \
     --n 3000 --seed 20261010 --buffer 45 --out /tmp/replay
 ```
+
+## Program Bus
+
+A flow session can mix short programs into its own PCM instead of interrupting playback. With
+the `stream_program_bus` setting on, `StreamsAudio.get_queue_flow_stream` opens one
+`FlowProgramBus` for the session (behind `CONF_STREAM_PROGRAM_BUS`, off by default) and publishes
+it on the streams controller while it runs. The bus counts the frames the session emits (a
+boundary's blend is one stream, so the overlap of the two items is counted once) and a
+program is placed at a frame: while that frame goes by, its audio is summed over the music, which
+is ducked for its duration. Every chunk leaves the bus with the length and the size it came in
+with, so the flow is neither restarted nor reopened and no second ffmpeg input is used; a chunk
+that ends in the middle of a frame carries those last bytes into the next one, so the stream the
+bus lets out stays frame aligned and no anchor behind it shifts. A chunk is mixed in slices of
+about a tenth of a second, with the event loop handed back between them, so a chunk that arrives
+in one piece (a crossfade, a long source read) does not stall the flow that produced it; `feed`
+is a coroutine for that. The bus
+sits inside the flow session, ahead of the encode with the player's output plan, so the queue's
+DSP/EQ preset shapes a program's voice exactly as it shapes the music under it.
+
+- `StreamsController.schedule_overlay(queue_id, pcm, *, label, start_in_seconds=0.0,
+  priority=None, kind=ProgramKind.TERM, head_seconds=0.0)` places a program and answers with a
+  `ScheduleResult`: `scheduled`,
+  `anchor_frame`, `frames` (the length the bus really plays, fewer than the offered one when it
+  had to drop the front of the program; a refused program reports the length it was offered
+  with), `late_by_seconds`, `lead_shortfall_seconds` and a `reason`
+  (`no_bus`, `no_audible_position`, `window_taken`, `too_late`, `format`, `bus_replaced`, the
+  ledger's `ledger_evicted`, the audio path's `head_outlasted`/`item_abandoned`/`flow_ended` for a
+  head it withdraws or a session that ends, and the provider's
+  `flow_ended`/`head_truncated`/`unknown_boundary`). Lateness is only reported for a kind that has
+  a boundary: an announcement or intro that was moved to the produced frames answers `0.0`, the
+  same as its ledger entry.
+  An announcement or intro is immediate: a `start_in_seconds` above zero, or a `priority` that
+  does not match the kind, raises `ValueError` instead of silently bypassing the boundary rules.
+  `priority` defaults to the rank its `kind` carries (announcement and intro: announcement, lead,
+  term, crossplay), so a caller only passes it to check its own caller's intent against the kind.
+  The program is placed a
+  `LEAD_MIN_LEAD_SECONDS` (about 2 s, so the audio reaches the player in time) after the frame the
+  queue's player reports having played, not after the produced end: what lies between the two is
+  already in the player's buffer. The depth of that buffer is what the reporting player gives; a
+  position that runs further back than any buffer (`MAX_BUFFERED_LEAD_SECONDS`), or none at all,
+  says nothing about it, so an immediate program falls back to `now + LEAD_MIN_LEAD_SECONDS`
+  (reported once per queue). A `start_in_seconds` delay is counted from the listener, so a program
+  planned for a boundary still to come starts where the listener will be at that boundary; a
+  negative delay is clamped to zero, and a delayed program without a heard position is not placed
+  at all (`no_audible_position`) instead of being pulled to the producer's edge.
+  `late_by_seconds` is how far the producer edge already moved the boundary, while
+  `lead_shortfall_seconds` says how much of the intended start the minimum lead ate: a lead is
+  never reported as lateness. A placement that collides with a scheduled one is settled by
+  priority (announcement/intro over lead over term over crossplay): the lower ranked program is
+  dropped as `window_taken`, the higher keeps its anchor, and two programs of the same priority
+  play one after the other. The ledger keeps the last 16 programs of a queue; when it has to
+  give up one that is still to be heard, that program ends as `dropped(ledger_evicted)`. A
+  queued announcement is the last to give way: it is cancelled at the overflow (so it can not
+  air as an "orphaned" program) and stays visible as `orphaned(ledger_evicted)` (so it is not
+  anchored a second time) until the next program reclaims its line, which keeps the history at
+  16 or 17 entries and the loss logged.
+- `StreamsController.cancel_overlay(queue_id, label, reason)` drops the programs still to be
+  heard under that label; `cancel_overlays(queue_id, reason)` drops every program of the queue.
+  Both run synchronously. A jump in the queue (`next`, `previous`, `skip`, `play_index`) goes
+  through `cancel_overlays_of_a_jump` instead: it drops what speaks for a boundary the queue will
+  not reach or for the moment it left (`skipped` for another item, `seeked` for a jump within the
+  one playing) and leaves the announcements alone, because a rendered clip is heard over the
+  stream and is anchored again on the bus the jump opens. `stop` and `pause` leave the clip
+  alone, and a session that ends hands its programs to the ledger (a term ends
+  `dropped(flow_ended)`, an announcement stays `orphaned` so a new bus can anchor it again).
+  Nothing is made up for later: the rest of the item plays without the duck. A head the audio
+  path withdraws itself reports the same vocabulary: `head_outlasted` when the item ended before
+  the head did, `item_abandoned` when the item's stream ended before the head reached its anchor.
+- `StreamsController.overlay_state(queue_id)` returns the queue's ledger of the last 16 programs
+  (17 while a given-up announcement is kept visible)
+  (`label`, `state` = `scheduled`/`aired`/`dropped`/`orphaned`, `start_frame`, `frames`, `reason`,
+  `priority`, `playing` = the listener is inside the program's window right now). A program is aired
+  once the listener reached its end, not when the bus produced it,
+  so a paused stream keeps its deadline, and a replaced bus ends a term as `dropped(bus_replaced)`
+  while an announcement becomes `orphaned` — unless the listener was already hearing it, which
+  ends it as `aired` (the jump cuts it, and it is not spoken a second time). `add_program_bus_listener`
+  reports `registered`/`replaced`/`released` per queue for whatever has to re-anchor on the new
+  bus.
+- `StreamsController.program_bus(queue_id)` is the audio path's read of that state, and carries no
+  program audio: `enabled` (the setting), `session_active`, `no_audible_position`, the PCM
+  `format` a program has to come in, the `claims` (`flow`, `boundary`), the programs still to
+  come as `overlays` (`label`, `state`, `start_in_seconds` from the heard position, `frames`,
+  `head_seconds`, `late_by_seconds`) and what ended as `last` (`label`, `state`, `reason`,
+  `frames`). Labels are cut to 64 characters, a start the listener already passed reads as `0.0`,
+  an overlay of a replaced bus has no countdown, and the whole answer is taken from one position
+  read so its countdowns and its deadlines can not disagree. The `head_seconds` a provider passes
+  to `schedule_overlay` is what the audio path shows, so a term's head is the planned one.
+- An item's declared lead (the `ai_radio_pre_overlap` queue item attributes) is placed on the same
+  bus, anchored at the item's declared end. With the experiment on, this path carries exactly one
+  case: a clip item the queue still holds, a leftover the guard spared when the switch came on (or
+  one the upgrade cleanup left where the player already owns the queue). With the bus on, the DJ
+  plans a term at the boundary instead of writing a clip item, so every other break speaks as a
+  term, and that is the normal case. Declared durations are whole-second media estimates and a seek
+  lands a few hundred ms away from them, so the head is not placed exactly: the frame comes from
+  `duration - seek`, and the residue between that end and the one the item really produced is
+  reported as `PROGRAM-BUS anchor drift=…ms` when the item ends. Nothing of the item is held back
+  for the placement, because a hold longer than the player's buffer starves the player and is heard
+  as the stream standing still with the reported position stepping back; the bus moves a head whose
+  frame is already produced forward (logged as `started late by`) instead of waiting for it. A head
+  whose window is not over when the item ends is dropped, so what is left of it never sounds over
+  the next item. A head is heard only when the bus mixes it at its frame: when a program of a
+  higher rank takes that window before the frame goes by (an announcement landing on it), the head
+  is given back to the item it was taken from - the prefetch that holds the clip past its head is
+  closed, so the clip plays from its first frame instead of starting with the words after a head
+  nobody heard.
+- A session that has the bus switched on selects float PCM for the flow (`overlay_active` in
+  `select_flow_pcm_format`, i.e. the same path the queue overlay uses): summing a voice over music
+  needs the headroom. The choice is made at play start, like every other flow format decision. A
+  session that passes a source format through instead (S16 with the source's own content type, or
+  anything but S16LE/F32LE) can not mix, and a lead is then left in the clip's own stream rather
+  than taken out of it.
+- `StreamsController.set_program_levels(queue_id, *, voice_db=0.0, duck_db=None)` sets the level a
+  queue mixes its programs at, and `program_levels(queue_id)` reads it back. The voice level is a
+  gain on the program's own audio, applied inside the bus before it is summed over the music, so it
+  moves the voice and not the music below it; the ducking depth is the envelope the same queue's
+  music goes down by while a program plays. Both belong to the queue, not to one program, so every
+  program of the queue is mixed at them, announcements included, and a flow restart hands them to
+  the new session's bus. `voice_db` runs from 0 to -9 dB (a program may be attenuated, never
+  boosted), `duck_db` from 0 to -12 dB, and `None` keeps `VOICE_OVER_DUCK_DEPTH`, the depth every
+  queue without a setting mixes with. A value outside its range raises `ValueError`. A program that
+  is already placed keeps the level it was placed with; a queue without a setting mixes exactly the
+  bytes the bus produced before there was one.
+- Programs never duck at the same time: a placement that would overlap one already scheduled is
+  moved to the end of that program's window, and one whose window would fall outside its
+  `stop_frame` is dropped, so its stream plays it whole.
+- A clip whose stream is heard whole across the boundary around it (a declared lead plus its
+  tail overlap) is summed into the boundary instead of being served: `_carry_bus_only_clip`
+  takes the rest of its stream, so the flow never opens it as an item of its own. The flow
+  marks no queue item for such a clip; a future provider that declares carried clips brings
+  that marker back.
+- `PROGRAM-BUS` debug lines: the session opening, each `schedule` with its `label` and `anchor`,
+  a program that starts `late`, `drained`, `cancel` with its `reason`, the anchor drift of a
+  lead, and a placement that had no position of the player to go by (reported once).
+
+`PlayerController.play_announcement(..., mode="overlay")` renders the clip completely, converts it
+to the session's PCM format and places it on the bus, so the player keeps playing and the
+announcement is heard once across the item it lands in. The pre-announce chime is part of what is
+rendered, so it plays with the clip; the announcement level is not applied, because the player
+keeps its own volume while the clip is mixed in — a level that was asked for is logged once
+instead, and a gain on the PCM can not stand in for it (the clip is rendered at full scale and
+summed under the mix ceiling, so an upward gain would only clip). The gate is a single place in the player
+controller: overlay mode, a flow mode player, the setting on, and a live flow session on the
+player's queue. Anything else — including the clip not being available — falls back to (or raises
+before) today's device route, which covers native announcement support and the builtin fallback.
+On a group player an overlay rides the group's own stream as one mix, so every member hears it in
+step; only the device route fans out to the individual members.
+
+The rendered clip is retained (`controllers/players/announcement_overlays.py`) until the ledger says
+it aired, so a bus that is replaced while the clip is still scheduled anchors it on the new bus
+instead of losing it; the goal is that a rendered announcement is never silently dropped. What a
+queue may hold is bounded, and these bounds are the current state rather than a design target:
+
+- the retention window is 5 minutes (`RETENTION_SECONDS`). The retention runs its own tick
+  (`SWEEP_SECONDS`, 60 s) while it holds anything, so a queue that rendered a clip and never hears
+  it (the player stands, the bus is gone) gives the bytes back on that deadline instead of waiting
+  for the next announcement;
+- above 16 clips (`SOFT_RETAINED_PER_QUEUE`) a queue only says so once, and keeps them;
+- the last resort is 64 clips (`HARD_RETAINED_PER_QUEUE`) **and** 32 MB of PCM
+  (`RETAINED_BYTES_PER_QUEUE`) per queue. The clip ceiling alone is no bound in practice: 64 clips
+  are a few hundred megabytes of F32 stereo at 48 kHz, which is why the byte budget is the count
+  that matters. The oldest clip that is not being heard right now goes first; a clip the ledger
+  reports as `playing` is never given up for the budget, so a queue whose clips are all being
+  heard stays over it (logged on the tick), and the clip ceiling gives up its oldest even then.
+
+One cell of the seek matrix reads differently here, and this is the current behaviour rather than
+the design's: a seek while the announcement is still rendering does not discard the clip. The
+render runs to its end and the clip is placed on the bus the seek opened, so it is heard once after
+the jump - the milder of the two outcomes, and a deviation that is not visible from the outside.
 
 ## Audio Overlay
 
