@@ -8,6 +8,7 @@ stream pair; the renderer picks and orders them to realize a ``TransitionPlan``.
 import logging
 from abc import ABC, abstractmethod
 from enum import StrEnum
+from typing import Literal
 
 # asendcmd applies a command at the next frame and raw PCM arrives in 4096-sample
 # (~93 ms) frames; re-chunked to 1024 samples and stepped every 25 ms, a 2-bar sweep
@@ -468,22 +469,36 @@ class VoiceOverMixFilter(Filter):
         logger: logging.Logger,
         overlap_seconds: float,
         ramp_seconds: float,
+        duck_side: Literal["in", "out"] = "in",
     ) -> None:
         """
         Initialize the voice over mix filter.
 
-        :param overlap_seconds: How long the voice plays over the incoming track.
-        :param ramp_seconds: How long the incoming track takes to return to full level
-            once the overlap has ended.
+        :param overlap_seconds: How long the voice plays over the item that is not the voice.
+        :param ramp_seconds: How long the level takes to move at the start (or, for a
+            trailing voice, back to full level after the overlap).
+        :param duck_side: "in" ducks the incoming item under the outgoing voice, "out" ducks
+            the outgoing item under the incoming voice.
         """
         self.overlap_seconds = overlap_seconds
         self.ramp_seconds = ramp_seconds
+        self.duck_side = duck_side
         super().__init__(logger)
 
     def apply(self, input_fadein_label: str, input_fadeout_label: str) -> list[str]:
         """Apply the duck envelope, mix and limiter chain."""
         overlap = self.overlap_seconds
         ramp = self.ramp_seconds
+        if self.duck_side == "out":
+            # the item being left is pulled down as the voice enters and stays there: it
+            # ends with the window, so there is nothing to ramp back up
+            envelope = f"1-{VOICE_OVER_DUCK_DEPTH}*min(1\\,t/{ramp:.3f})"
+            fadeout_chain = f"volume=eval=frame:volume='{envelope}'"
+            return [
+                f"{input_fadeout_label}{fadeout_chain}[voice_over_out]",
+                f"{input_fadein_label}[voice_over_out]amix=inputs=2:normalize=0,"
+                f"alimiter=limit={MIX_CEILING_DB}dB:level=false:latency=true",
+            ]
         # 1 - depth while the voice talks, a linear ramp back to 1 after it
         envelope = (
             f"1-{VOICE_OVER_DUCK_DEPTH}*max(0\\,min(1\\,({overlap:.3f}+{ramp:.3f}-t)/{ramp:.3f}))"
@@ -498,4 +513,4 @@ class VoiceOverMixFilter(Filter):
 
     def __repr__(self) -> str:
         """Return string representation of VoiceOverMixFilter."""
-        return f"VoiceOverMix(overlap={self.overlap_seconds:.2f}s)"
+        return f"VoiceOverMix(overlap={self.overlap_seconds:.2f}s, duck={self.duck_side})"
