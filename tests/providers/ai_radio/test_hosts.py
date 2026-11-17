@@ -14,6 +14,11 @@ from music_assistant_models.errors import InvalidDataError
 from music_assistant.providers.ai_radio.constants import (
     DEFAULT_LLM_INSTRUCTIONS,
     EVENT_HOSTS_UPDATED,
+    MAX_CONTRIBUTION_DEFAULT_SECONDS,
+    MAX_CONTRIBUTION_MAX_SECONDS,
+    MAX_CONTRIBUTION_MIN_SECONDS,
+    TERM_HEAD_DEFAULT_SECONDS,
+    TERM_HEAD_MAX_SECONDS,
 )
 from music_assistant.providers.ai_radio.hosts import (
     PRESET_HOSTS,
@@ -160,6 +165,147 @@ def test_normalize_host_keeps_option_value_types() -> None:
     assert isinstance(normalized["options"]["speed"], int)
 
 
+def test_normalize_host_defaults_missing_term_head_seconds_to_two() -> None:
+    """Normalize a host with no 'term_head_seconds' key at all, for backwards compatibility."""
+    dummy = DummyHosts()
+    dummy._sections = {"Song_Transition": _section("Song_Transition")}
+    payload = _host(["Song_Transition"])
+    assert "term_head_seconds" not in payload
+    normalized = dummy._normalize_host(payload)
+    assert normalized["term_head_seconds"] == 2.0
+
+
+def test_normalize_host_defaults_none_term_head_seconds() -> None:
+    """A client that sends null gets the default rather than a rejected save."""
+    dummy = DummyHosts()
+    dummy._sections = {"Song_Transition": _section("Song_Transition")}
+    payload = {**_host(["Song_Transition"]), "term_head_seconds": None}
+    normalized = dummy._normalize_host(payload)
+    assert normalized["term_head_seconds"] == 2.0
+
+
+def test_normalize_host_persists_term_head_seconds() -> None:
+    """Keep the seconds a host starts its breaks before a boundary, as a float."""
+    dummy = DummyHosts()
+    dummy._sections = {"Song_Transition": _section("Song_Transition")}
+    payload = {**_host(["Song_Transition"]), "term_head_seconds": 5}
+    normalized = dummy._normalize_host(payload)
+    assert normalized["term_head_seconds"] == 5.0
+    assert isinstance(normalized["term_head_seconds"], float)
+
+
+@pytest.mark.parametrize("value", [0, 0.0, 12, TERM_HEAD_MAX_SECONDS])
+def test_normalize_host_accepts_the_lead_range_bounds(value: float) -> None:
+    """Both ends of the documented range are valid leads."""
+    dummy = DummyHosts()
+    dummy._sections = {"Song_Transition": _section("Song_Transition")}
+    payload = {**_host(["Song_Transition"]), "term_head_seconds": value}
+    assert dummy._normalize_host(payload)["term_head_seconds"] == pytest.approx(float(value))
+
+
+@pytest.mark.parametrize("value", [-0.1, TERM_HEAD_MAX_SECONDS + 0.1, "five", [5]])
+def test_normalize_host_rejects_an_invalid_term_head_seconds(value: Any) -> None:
+    """A lead outside the range (or not a number) is a rejected save."""
+    dummy = DummyHosts()
+    dummy._sections = {"Song_Transition": _section("Song_Transition")}
+    payload = {**_host(["Song_Transition"]), "term_head_seconds": value}
+    with pytest.raises(InvalidDataError, match="term_head_seconds"):
+        dummy._normalize_host(payload)
+
+
+def test_term_head_seconds_survives_the_hosts_file(tmp_path: Any) -> None:
+    """A stored lead comes back from disk, and a host that predates it reads the default."""
+    sections = {"Song_Transition": _section("Song_Transition")}
+    hosts_file = tmp_path / "hosts.json"
+    writer = DummyHosts()
+    writer._sections = sections
+    writer._hosts_file = hosts_file
+    payload = {**_host(["Song_Transition"]), "term_head_seconds": 7.5}
+    writer._hosts = {"rick": writer._normalize_host(payload)}
+    # a host stored before the setting existed has no key for it
+    legacy = {
+        key: value for key, value in writer._hosts["rick"].items() if key != "term_head_seconds"
+    }
+    legacy.update({"id": "legacy", "name": "Legacy"})
+    hosts_file.write_text(json.dumps({"version": 1, "hosts": [writer._hosts["rick"], legacy]}))
+
+    reader = DummyHosts()
+    reader._sections = sections
+    reader._hosts_file = hosts_file
+    asyncio.run(reader._load_hosts())
+
+    assert reader._hosts["rick"]["term_head_seconds"] == 7.5
+    assert reader._hosts["legacy"]["term_head_seconds"] == TERM_HEAD_DEFAULT_SECONDS
+
+
+def test_normalize_host_defaults_a_missing_contribution_ceiling_to_45() -> None:
+    """A host stored before the setting existed speaks up to the default ceiling."""
+    dummy = DummyHosts()
+    dummy._sections = {"Song_Transition": _section("Song_Transition")}
+    payload = _host(["Song_Transition"])
+    assert "max_contribution_seconds" not in payload
+    normalized = dummy._normalize_host(payload)
+    assert normalized["max_contribution_seconds"] == MAX_CONTRIBUTION_DEFAULT_SECONDS
+
+
+def test_normalize_host_persists_the_contribution_ceiling() -> None:
+    """Keep the seconds one spoken contribution may last, as a float."""
+    dummy = DummyHosts()
+    dummy._sections = {"Song_Transition": _section("Song_Transition")}
+    payload = {**_host(["Song_Transition"]), "max_contribution_seconds": 20}
+    normalized = dummy._normalize_host(payload)
+    assert normalized["max_contribution_seconds"] == 20.0
+    assert isinstance(normalized["max_contribution_seconds"], float)
+
+
+@pytest.mark.parametrize("value", [MAX_CONTRIBUTION_MIN_SECONDS, 60, MAX_CONTRIBUTION_MAX_SECONDS])
+def test_normalize_host_accepts_the_contribution_ceiling_range(value: float) -> None:
+    """Both ends of the documented range are valid ceilings."""
+    dummy = DummyHosts()
+    dummy._sections = {"Song_Transition": _section("Song_Transition")}
+    payload = {**_host(["Song_Transition"]), "max_contribution_seconds": value}
+    assert dummy._normalize_host(payload)["max_contribution_seconds"] == pytest.approx(float(value))
+
+
+@pytest.mark.parametrize(
+    "value",
+    [MAX_CONTRIBUTION_MIN_SECONDS - 1, MAX_CONTRIBUTION_MAX_SECONDS + 1, None, "twenty", [20]],
+)
+def test_normalize_host_rejects_an_invalid_contribution_ceiling(value: Any) -> None:
+    """A ceiling outside the range, or not a number at all, is a rejected save."""
+    dummy = DummyHosts()
+    dummy._sections = {"Song_Transition": _section("Song_Transition")}
+    payload = {**_host(["Song_Transition"]), "max_contribution_seconds": value}
+    with pytest.raises(InvalidDataError, match="max_contribution_seconds"):
+        dummy._normalize_host(payload)
+
+
+def test_the_contribution_ceiling_survives_the_hosts_file(tmp_path: Any) -> None:
+    """A stored ceiling comes back from disk, and a host that predates it reads the default."""
+    sections = {"Song_Transition": _section("Song_Transition")}
+    hosts_file = tmp_path / "hosts.json"
+    writer = DummyHosts()
+    writer._sections = sections
+    writer._hosts_file = hosts_file
+    payload = {**_host(["Song_Transition"]), "max_contribution_seconds": 30}
+    writer._hosts = {"rick": writer._normalize_host(payload)}
+    legacy = {
+        key: value
+        for key, value in writer._hosts["rick"].items()
+        if key != "max_contribution_seconds"
+    }
+    legacy.update({"id": "legacy", "name": "Legacy"})
+    hosts_file.write_text(json.dumps({"version": 1, "hosts": [writer._hosts["rick"], legacy]}))
+
+    reader = DummyHosts()
+    reader._sections = sections
+    reader._hosts_file = hosts_file
+    asyncio.run(reader._load_hosts())
+
+    assert reader._hosts["rick"]["max_contribution_seconds"] == 30.0
+    assert reader._hosts["legacy"]["max_contribution_seconds"] == (MAX_CONTRIBUTION_DEFAULT_SECONDS)
+
+
 def test_normalize_host_rejects_unknown_section_reference() -> None:
     """Reject hosts that reference shared sections that do not exist."""
     dummy = DummyHosts()
@@ -229,6 +375,106 @@ def test_default_host_template_is_normalizable() -> None:
     template = dummy._default_host_template()
     normalized = dummy._normalize_host(template)
     assert normalized["merge_section_id"] == "Between_Songs_Smoother"
+
+
+def test_a_host_without_the_switches_speaks_its_intro_and_outro() -> None:
+    """A host stored before the switches existed behaves exactly as it always did."""
+    dummy = DummyHosts()
+    dummy._sections = {"Song_Transition": _section("Song_Transition")}
+    payload = _host(["Song_Transition"])
+    assert "play_intro" not in payload
+    assert "play_outro" not in payload
+
+    normalized = dummy._normalize_host(payload)
+
+    assert normalized["play_intro"] is True
+    assert normalized["play_outro"] is True
+
+
+@pytest.mark.parametrize("value", [True, False])
+def test_the_switches_are_kept_as_they_were_saved(value: bool) -> None:
+    """Both switches are stored as booleans, switched off included."""
+    dummy = DummyHosts()
+    dummy._sections = {"Song_Transition": _section("Song_Transition")}
+    payload = {
+        **_host(["Song_Transition"]),
+        "play_intro": value,
+        "play_outro": value,
+    }
+
+    normalized = dummy._normalize_host(payload)
+
+    assert normalized["play_intro"] is value
+    assert normalized["play_outro"] is value
+
+
+def test_a_null_switch_reads_as_the_default() -> None:
+    """A client that sends null gets the default rather than a rejected save."""
+    dummy = DummyHosts()
+    dummy._sections = {"Song_Transition": _section("Song_Transition")}
+    payload = {**_host(["Song_Transition"]), "play_intro": None, "play_outro": None}
+
+    normalized = dummy._normalize_host(payload)
+
+    assert (normalized["play_intro"], normalized["play_outro"]) == (True, True)
+
+
+@pytest.mark.parametrize("value", ["yes", 1, 0, "false", [], {}])
+@pytest.mark.parametrize("field", ["play_intro", "play_outro"])
+def test_a_switch_that_is_not_a_boolean_is_refused(field: str, value: Any) -> None:
+    """A switch is on or off, so a string or a number is a rejected save."""
+    dummy = DummyHosts()
+    dummy._sections = {"Song_Transition": _section("Song_Transition")}
+    payload = {**_host(["Song_Transition"]), field: value}
+
+    with pytest.raises(InvalidDataError, match=field):
+        dummy._normalize_host(payload)
+
+
+def test_the_switches_survive_the_hosts_file(tmp_path: Any) -> None:
+    """Stored switches come back from disk, and a host that predates them reads the defaults."""
+    sections = {"Song_Transition": _section("Song_Transition")}
+    hosts_file = tmp_path / "hosts.json"
+    writer = DummyHosts()
+    writer._sections = sections
+    writer._hosts_file = hosts_file
+    payload = {**_host(["Song_Transition"]), "play_intro": False, "play_outro": False}
+    writer._hosts = {"rick": writer._normalize_host(payload)}
+    legacy = {
+        key: value
+        for key, value in writer._hosts["rick"].items()
+        if key not in ("play_intro", "play_outro")
+    }
+    legacy.update({"id": "legacy", "name": "Legacy"})
+    hosts_file.write_text(json.dumps({"version": 1, "hosts": [writer._hosts["rick"], legacy]}))
+
+    reader = DummyHosts()
+    reader._sections = sections
+    reader._hosts_file = hosts_file
+    asyncio.run(reader._load_hosts())
+
+    assert (reader._hosts["rick"]["play_intro"], reader._hosts["rick"]["play_outro"]) == (
+        False,
+        False,
+    )
+    assert (reader._hosts["legacy"]["play_intro"], reader._hosts["legacy"]["play_outro"]) == (
+        True,
+        True,
+    )
+
+
+def test_the_host_template_switches_both_on() -> None:
+    """A host created from the template speaks its intro and its outro."""
+    template = DummyHosts()._default_host_template()
+
+    assert (template["play_intro"], template["play_outro"]) == (True, True)
+
+
+def test_a_preset_host_switches_both_on() -> None:
+    """A host added from a bundled preset speaks its intro and its outro."""
+    host, _sections = _compile_preset_host(PRESET_HOSTS[0], "preset_copy")
+
+    assert (host["play_intro"], host["play_outro"]) == (True, True)
 
 
 def test_write_and_load_hosts_round_trips_normalized_host(tmp_path: Any) -> None:

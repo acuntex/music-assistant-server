@@ -19,10 +19,17 @@ from music_assistant.helpers.json import async_json_loads, json_dumps
 from .constants import (
     DEFAULT_LLM_INSTRUCTIONS,
     EVENT_HOSTS_UPDATED,
+    HOST_SWITCH_DEFAULT,
+    MAX_CONTRIBUTION_DEFAULT_SECONDS,
+    MAX_CONTRIBUTION_MAX_SECONDS,
+    MAX_CONTRIBUTION_MIN_SECONDS,
     MERGE_SECTION_PROMPT,
     NEWS_BULLETIN_PROMPT,
     SHARED_HOST_RULES,
     SONG_TRANSITION_PROMPT,
+    TERM_HEAD_DEFAULT_SECONDS,
+    TERM_HEAD_MAX_SECONDS,
+    TERM_HEAD_MIN_SECONDS,
     WEATHER_UPDATE_PROMPT,
 )
 from .helpers import slugify
@@ -427,6 +434,13 @@ class AIRadioHostsMixin:
             "tts_engine": tts_engine,
             "language": language,
             "options": options,
+            "term_head_seconds": _normalize_term_head_seconds(host.get("term_head_seconds")),
+            "max_contribution_seconds": _normalize_contribution_seconds(
+                host.get("max_contribution_seconds", MAX_CONTRIBUTION_DEFAULT_SECONDS)
+            ),
+            # the host decides whether its own intro and outro are spoken at all
+            "play_intro": _normalize_switch(host.get("play_intro"), "play_intro"),
+            "play_outro": _normalize_switch(host.get("play_outro"), "play_outro"),
             "section_ids": section_ids,
             "section_order": deepcopy(raw_section_order),
             "merge_section_id": merge_section_id,
@@ -465,6 +479,13 @@ class AIRadioHostsMixin:
             "tts_engine": "",
             "language": "",
             "options": {},
+            # how far a break of this host starts before the boundary it speaks at
+            "term_head_seconds": TERM_HEAD_DEFAULT_SECONDS,
+            # how long one spoken contribution of this host may last
+            "max_contribution_seconds": MAX_CONTRIBUTION_DEFAULT_SECONDS,
+            # whether this host opens and closes the queue it speaks over
+            "play_intro": HOST_SWITCH_DEFAULT,
+            "play_outro": HOST_SWITCH_DEFAULT,
             "section_ids": default_section_ids,
             "section_order": [
                 {"when": "start_of_playlist", "flow": [{"MUST": "Song_Introduction_Start"}]},
@@ -638,6 +659,10 @@ def _compile_preset_host(
         "tts_engine": "",
         "language": "",
         "options": {},
+        "term_head_seconds": TERM_HEAD_DEFAULT_SECONDS,
+        "max_contribution_seconds": MAX_CONTRIBUTION_DEFAULT_SECONDS,
+        "play_intro": HOST_SWITCH_DEFAULT,
+        "play_outro": HOST_SWITCH_DEFAULT,
         "section_ids": [section["id"] for section in sections],
         "section_order": section_order,
         "merge_section_id": merge_section_id,
@@ -661,6 +686,85 @@ def _strip_preset_tag(host: dict[str, Any]) -> None:
     """Turn a preset copy into a custom host."""
     host.pop("preset_id", None)
     host.pop("preset_hash", None)
+
+
+def _normalize_term_head_seconds(value: Any) -> float:
+    """
+    Validate the seconds before a boundary a host wants its breaks to start.
+
+    A host stored before the setting existed has no value, and reads as the default.
+
+    :param value: The configured number of seconds, or None.
+    """
+    if value is None:
+        return TERM_HEAD_DEFAULT_SECONDS
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError) as err:
+        raise InvalidDataError("term_head_seconds must be a number of seconds") from err
+    if not TERM_HEAD_MIN_SECONDS <= seconds <= TERM_HEAD_MAX_SECONDS:
+        raise InvalidDataError(
+            f"term_head_seconds must be between {TERM_HEAD_MIN_SECONDS:g} and "
+            f"{TERM_HEAD_MAX_SECONDS:g} seconds"
+        )
+    return seconds
+
+
+def _normalize_contribution_seconds(value: Any) -> float:
+    """
+    Validate the ceiling a host sets for one spoken contribution.
+
+    A host stored before the setting existed carries no value and reads as the default; a
+    value that was stored has to be a usable number, so a broken one is refused instead of
+    silently replaced.
+
+    :param value: The configured ceiling in seconds.
+    """
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError) as err:
+        raise InvalidDataError("max_contribution_seconds must be a number of seconds") from err
+    if not MAX_CONTRIBUTION_MIN_SECONDS <= seconds <= MAX_CONTRIBUTION_MAX_SECONDS:
+        raise InvalidDataError(
+            f"max_contribution_seconds must be between {MAX_CONTRIBUTION_MIN_SECONDS:g} and "
+            f"{MAX_CONTRIBUTION_MAX_SECONDS:g} seconds"
+        )
+    return seconds
+
+
+def host_plays_intro(host: dict[str, Any] | None) -> bool:
+    """
+    Return whether the given host opens the queue it speaks over with an intro.
+
+    :param host: The host profile, or None when the queue names a host that is gone.
+    """
+    return bool((host or {}).get("play_intro", HOST_SWITCH_DEFAULT))
+
+
+def host_plays_outro(host: dict[str, Any] | None) -> bool:
+    """
+    Return whether the given host closes the queue it speaks over with an outro.
+
+    :param host: The host profile, or None when the queue names a host that is gone.
+    """
+    return bool((host or {}).get("play_outro", HOST_SWITCH_DEFAULT))
+
+
+def _normalize_switch(value: Any, field: str) -> bool:
+    """
+    Validate one of a host's own on/off switches.
+
+    A host stored before the switch existed carries no value, and reads as switched on, so
+    it keeps speaking both.
+
+    :param value: The configured switch, or None.
+    :param field: Name of the field, for the error a rejected save returns.
+    """
+    if value is None:
+        return HOST_SWITCH_DEFAULT
+    if not isinstance(value, bool):
+        raise InvalidDataError(f"{field} must be true or false")
+    return value
 
 
 def _optional_flow_item(section_id: str, segment: _PresetSegment) -> dict[str, Any]:
