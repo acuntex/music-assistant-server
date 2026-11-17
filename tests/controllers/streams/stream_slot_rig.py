@@ -225,6 +225,8 @@ class SlotRig:
         mass.streams.audio_analysis.start_analysis = AsyncMock()
         mass.streams.audio_analysis.get_audio_analysis = AsyncMock(return_value=None)
         mass.streams.source_normalizes_audio.return_value = False
+        # no plugin asks for a lead over the item tails of these queues
+        mass.streams.lead_hold_required.return_value = False
         self.queues = PlayerQueuesController.__new__(PlayerQueuesController)
         self.queues.mass = mass
         self.queues.logger = MagicMock()

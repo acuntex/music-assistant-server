@@ -55,6 +55,7 @@ class SmartFadesMixer:
         mode: CrossfadeMode,
         fade_out_data: bytes,
         fade_in_bytes_len: int,
+        lead: bool = False,
     ) -> SmartFade:
         """
         Pick the SmartFade implementation, prime its filters, and return it.
@@ -71,10 +72,12 @@ class SmartFadesMixer:
         :param mode: Smart fades mode (SMART_CROSSFADE, STANDARD_CROSSFADE or VOICE_OVER).
         :param fade_out_data: PCM buffer of the outgoing track's tail.
         :param fade_in_bytes_len: Expected length in bytes of the fade-in input.
+        :param lead: True when the incoming item starts over the outgoing item's tail, so the
+            outgoing side is the one ducked under the voice.
         """
         if mode == CrossfadeMode.VOICE_OVER:
             # a declared transition: played as declared, never planned or degraded
-            voice_over = VoiceOverFade(logger=self.logger)
+            voice_over = VoiceOverFade(logger=self.logger, duck_side="out" if lead else "in")
             voice_over.build(len(fade_out_data), fade_in_bytes_len, pcm_format)
             self.logger.debug(
                 "Built voice over: tail=%.2fs fade_in=%.2fs overlap=%.2fs",
