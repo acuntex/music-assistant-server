@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from pathlib import Path
 from types import SimpleNamespace
@@ -20,6 +21,7 @@ from music_assistant.providers.ai_radio.constants import (
     CONF_AI_ENGINE,
     CONF_TTS_ENGINE,
     ENGINE_RETRY_DELAY,
+    MAX_CONTRIBUTION_DEFAULT_SECONDS,
 )
 from music_assistant.providers.ai_radio.models import DJQueueState
 from music_assistant.providers.ai_radio.provider import AIRadioProvider
@@ -106,6 +108,92 @@ async def test_host_crud_roundtrip(provider: Any) -> None:
     assert fetched["name"] == saved["name"]
     await provider.delete_host("default_host")
     assert await provider.list_hosts() == []
+
+
+@pytest.mark.asyncio
+async def test_saving_a_host_keeps_the_lead_it_was_given(provider: Any) -> None:
+    """A lead set through the host update comes back from the API and from the hosts file."""
+    host = await provider.host_template()
+    host["term_head_seconds"] = 5.0
+
+    saved = await provider.save_host(host)
+
+    assert saved["term_head_seconds"] == 5.0
+    assert (await provider.get_host(saved["id"]))["term_head_seconds"] == 5.0
+    assert (await provider.list_hosts())[0]["term_head_seconds"] == 5.0
+    stored = json.loads(provider._hosts_file.read_text())["hosts"]
+    assert stored[0]["term_head_seconds"] == 5.0
+
+
+@pytest.mark.asyncio
+async def test_a_saved_host_without_a_lead_reports_the_default(provider: Any) -> None:
+    """A host saved by a client that does not know the setting reads back the default."""
+    host = await provider.host_template()
+    host.pop("term_head_seconds", None)
+
+    saved = await provider.save_host(host)
+
+    assert saved["term_head_seconds"] == 2.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("lead", [-1.0, 13.0])
+async def test_a_host_with_a_lead_out_of_range_is_refused(provider: Any, lead: float) -> None:
+    """The range is validated on the update, so no host can store a lead it can not use."""
+    host = await provider.host_template()
+    host["term_head_seconds"] = lead
+
+    with pytest.raises(InvalidDataError, match="term_head_seconds"):
+        await provider.save_host(host)
+
+
+@pytest.mark.asyncio
+async def test_the_host_template_carries_the_contribution_ceiling(provider: Any) -> None:
+    """A client editing a host finds the ceiling the renderer uses as the default."""
+    host = await provider.host_template()
+
+    assert host["max_contribution_seconds"] == MAX_CONTRIBUTION_DEFAULT_SECONDS
+
+
+@pytest.mark.asyncio
+async def test_saving_a_host_keeps_the_contribution_ceiling(provider: Any) -> None:
+    """A ceiling set through the host update comes back from the API and from the hosts file."""
+    host = await provider.host_template()
+    host["max_contribution_seconds"] = 30
+
+    saved = await provider.save_host(host)
+
+    assert saved["max_contribution_seconds"] == 30.0
+    assert (await provider.get_host(saved["id"]))["max_contribution_seconds"] == 30.0
+    assert (await provider.list_hosts())[0]["max_contribution_seconds"] == 30.0
+    stored = json.loads(provider._hosts_file.read_text())["hosts"]
+    assert stored[0]["max_contribution_seconds"] == 30.0
+
+
+@pytest.mark.asyncio
+async def test_a_saved_host_without_a_contribution_ceiling_reports_the_default(
+    provider: Any,
+) -> None:
+    """A host saved by a client that does not know the setting reads back the default."""
+    host = await provider.host_template()
+    host.pop("max_contribution_seconds", None)
+
+    saved = await provider.save_host(host)
+
+    assert saved["max_contribution_seconds"] == MAX_CONTRIBUTION_DEFAULT_SECONDS
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("ceiling", [14, 91, None, "twenty"])
+async def test_a_host_with_a_contribution_ceiling_out_of_range_is_refused(
+    provider: Any, ceiling: Any
+) -> None:
+    """The range is validated on the update, so no host can store a ceiling it can not use."""
+    host = await provider.host_template()
+    host["max_contribution_seconds"] = ceiling
+
+    with pytest.raises(InvalidDataError, match="max_contribution_seconds"):
+        await provider.save_host(host)
 
 
 @pytest.mark.asyncio
@@ -572,6 +660,9 @@ async def test_unload_cancels_an_in_flight_queue_dj_replan() -> None:
 
     with pytest.raises(asyncio.CancelledError):
         await asyncio.wait_for(replan_task, timeout=5)
+    # the queue no longer asks for mixed boundaries for a host that is gone
+    streams = cast("Any", provider.mass.streams)
+    streams.set_boundary_mix_required.assert_called_once_with("queue-1", "ai_radio", False)
 
 
 async def test_engine_recheck_stays_silent_when_the_provider_unloads_during_the_wait(
@@ -635,6 +726,48 @@ async def test_engine_watchdog_arms_a_reload_after_unloading(
     retry = cast("Any", provider.mass).call_later.call_args
     assert retry.args == (ENGINE_RETRY_DELAY, provider.mass.load_provider, "ai_radio")
     assert retry.kwargs == {"allow_retry": True, "task_id": "load_provider_ai_radio"}
+
+
+async def test_loaded_in_mass_cleans_the_old_dj_clips_before_the_first_replan() -> None:
+    """The one-off queue cleanup runs before any armed queue is replanned."""
+    provider, _, _ = _make_engine_provider(
+        [_make_engine_plugin("p1", ["ai"], ["tts"])],
+        setup_values={CONF_AI_ENGINE: "p1/ai", CONF_TTS_ENGINE: "p1/tts"},
+    )
+    provider._armed_show_queues = {}
+    provider._dj_queues["queue-1"] = DJQueueState(
+        queue_id="queue-1", host_id="rick", dj_session_id="dj0123456789"
+    )
+    calls: list[str] = []
+
+    async def _cleanup() -> None:
+        calls.append("cleanup")
+
+    provider._cleanup_legacy_dj_items = _cleanup  # type: ignore[method-assign]
+    provider._schedule_replan = lambda queue_id: calls.append(f"replan:{queue_id}")  # type: ignore[method-assign]
+
+    await provider.loaded_in_mass()
+
+    assert calls == ["cleanup", "replan:queue-1"]
+
+
+async def test_a_queue_that_registers_after_the_start_runs_the_cleanup() -> None:
+    """A queue that arrives after the start gets its old clips cleared on its own event."""
+    provider, _, _ = _make_engine_provider([])
+    provider._armed_show_queues = {}
+    runs: list[str] = []
+
+    async def _cleanup() -> None:
+        runs.append("cleanup")
+
+    provider._cleanup_legacy_dj_items = _cleanup  # type: ignore[method-assign]
+    cast("Any", provider.mass).player_queues.get.side_effect = lambda *_args, **_kwargs: None
+
+    await provider._on_dj_queue_event(
+        SimpleNamespace(event=EventType.QUEUE_ADDED, object_id="queue-1")
+    )
+
+    assert runs == ["cleanup"]
 
 
 async def test_stations_are_played_by_everyone_and_edited_by_admins() -> None:

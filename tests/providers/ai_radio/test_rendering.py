@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 import pytest
 from music_assistant_models.enums import (
     ContentType,
+    CrossfadeMode,
     MediaType,
     PlaybackState,
     StreamType,
@@ -46,9 +47,13 @@ from music_assistant.helpers.tags import AudioTags
 from music_assistant.helpers.tts import TTSLanguageNotSupportedError
 from music_assistant.models.plugin import PluginProvider, TTSEngine
 from music_assistant.providers.ai_radio.constants import (
+    AI_COOLDOWN_SECONDS,
     ATTR_ALLOW_POST,
+    ATTR_ALLOW_PRE,
     ATTR_HOST_ID,
     ATTR_MAX_CHARS,
+    ATTR_PRE_FROM,
+    ATTR_PRE_OVERLAP,
     ATTR_PROMPT,
     ATTR_QUEUE_DJ,
     ATTR_RENDERED_TEXT,
@@ -62,12 +67,20 @@ from music_assistant.providers.ai_radio.constants import (
     DEFAULT_LLM_INSTRUCTIONS,
     FALLBACK_TRACK_SECONDS,
     MIN_LOUDNESS_REFERENCE_SECONDS,
+    MIN_PRE_SECONDS,
     NO_WEATHER_DATA_INSTRUCTION,
+    TALK_OVER_MAX_PRE,
     TTS_CLIP_PCM_FORMAT,
+    TTS_COOLDOWN_SECONDS,
     TTS_PEAK_CEILING_DB,
     TTS_SPEECHNORM_FILTER,
 )
-from music_assistant.providers.ai_radio.models import DJQueueState, RenderHealth
+from music_assistant.providers.ai_radio.models import (
+    DJQueueState,
+    PlannedSection,
+    RenderHealth,
+    RenderPart,
+)
 from music_assistant.providers.ai_radio.rendering import AIRadioRenderMixin
 
 from .events import ProviderEventRecorder
@@ -105,9 +118,9 @@ class DummyRenderer(ProviderEventRecorder, AIRadioRenderMixin):
     def _configured_now(self) -> Any:
         return __import__("datetime").datetime(2026, 7, 30, 18, 30)
 
-    def _pause_queue_dj(self, queue_id: str, failed_item_id: str) -> None:
-        """Record the queue whose DJ would pause instead of pausing it."""
-        self.paused.append((queue_id, failed_item_id))
+    def _pause_queue_dj(self, queue_id: str, failed_item_id: str, cooldown_seconds: float) -> None:
+        """Record the queue whose DJ would pause, and for how long, instead of pausing it."""
+        self.paused.append((queue_id, failed_item_id, cooldown_seconds))
 
     async def _generate_text(
         self, instructions: str, prompt: str, web_mode: str, language: str | None = None
@@ -215,6 +228,21 @@ def _clip_item(clip_id: str, queue_id: str = "player_a", **overrides: Any) -> Qu
     )
 
 
+def _section(section_id: str = "intro") -> PlannedSection:
+    """Build a planned section that can be mixed into a queue's stream."""
+    return PlannedSection(
+        order=0,
+        clip_id=f"sess_001_{section_id}",
+        section_id=section_id,
+        section_name=section_id.title(),
+        when="start_of_playlist",
+        insert_at_index=0,
+        prompt="Say hello at <timestamp>",
+        max_chars=200,
+        web_search_mode="disabled",
+    )
+
+
 def _attach_queues(renderer: DummyRenderer, queues: dict[str, list[QueueItem]]) -> list[bool]:
     """Wire a minimal player_queues stub and return the signal_update call log."""
     signals: list[bool] = []
@@ -232,6 +260,11 @@ def _attach_queues(renderer: DummyRenderer, queues: dict[str, list[QueueItem]]) 
                     if item.queue_item_id == queue_item_id
                 ),
                 None,
+            ),
+            get_item=lambda queue_id, index: (
+                queues.get(queue_id, [])[index]
+                if 0 <= index < len(queues.get(queue_id, []))
+                else None
             ),
             signal_update=lambda _queue_id, items_changed=False: signals.append(items_changed),
         ),
@@ -704,7 +737,7 @@ async def test_a_failed_clip_is_not_rendered_again() -> None:
     assert renderer.llm_calls == 1
     assert len(renderer.tts_texts) == 1
     assert item.available is False
-    assert state.render_health.failures == 1
+    assert state.render_health.tts.failures == 1
     # one update stores the rendered script, the other publishes the clip as unplayable
     assert signals == [True, True]
 
@@ -721,7 +754,7 @@ async def test_a_request_waiting_behind_a_failed_render_does_not_render_again() 
 
     assert all(isinstance(result, MediaNotFoundError) for result in results)
     assert len(renderer.tts_texts) == 1
-    assert state.render_health.failures == 1
+    assert state.render_health.tts.failures == 1
 
 
 @pytest.mark.parametrize(
@@ -744,7 +777,7 @@ async def test_three_failed_renders_in_a_row_pause_the_breaks(
 
     assert renderer.llm_calls == 3
     assert len(renderer.tts_texts) == 3
-    assert renderer.paused == [("player_a", "qi_djlive_003")]
+    assert renderer.paused == [("player_a", "qi_djlive_003", TTS_COOLDOWN_SECONDS)]
     warnings = _pause_warnings(caplog)
     assert len(warnings) == 1
     assert named_engine in warnings[0]
@@ -774,10 +807,13 @@ async def test_the_pause_names_the_engine_that_resolved(
     with caplog.at_level(logging.WARNING, logger="tests.ai_radio.rendering"):
         await _fail_renders(renderer, "djlive_001", "djlive_002", "djlive_003")
 
-    assert state.render_health.cooling_down(asyncio.get_running_loop().time())
+    assert state.render_health.tts_cooling_down(asyncio.get_running_loop().time())
     warnings = _pause_warnings(caplog)
     assert len(warnings) == 1
     assert named_engine in warnings[0]
+    # only the voice failed, so only the voice pauses
+    assert "TTS engine failed 3 times" in warnings[0]
+    assert "5 minutes" in warnings[0]
 
 
 async def test_a_successful_render_resets_the_failure_count() -> None:
@@ -787,33 +823,93 @@ async def test_a_successful_render_resets_the_failure_count() -> None:
     await _fail_renders(renderer, "djlive_001", "djlive_002")
     renderer.fail_tts = False
     await renderer.get_stream_details("djlive_003", MediaType.SOUND_EFFECT)
-    assert state.render_health.failures == 0
+    assert state.render_health.tts.failures == 0
     renderer.fail_tts = True
     await _fail_renders(renderer, "djlive_004", "djlive_005")
 
-    assert state.render_health.failures == 2
+    assert state.render_health.tts.failures == 2
     assert not state.render_health.cooling_down(asyncio.get_running_loop().time())
 
 
-async def test_ai_and_tts_failures_count_alike(caplog: pytest.LogCaptureFixture) -> None:
-    """A failed AI query and a failed TTS call both count towards the pause."""
-    renderer, state = _failing_dj_renderer(3)
+async def test_the_ai_and_the_voice_keep_their_own_counts(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failed query and a failed voice call count apart, so neither pauses the other."""
+    renderer, state = _failing_dj_renderer(5)
     renderer.fail_tts = False
     renderer.fail_generation = True
-    await _fail_renders(renderer, "djlive_001")
+    await _fail_renders(renderer, "djlive_001", "djlive_002")
+
+    assert state.render_health.ai.failures == 2
+    assert state.render_health.tts.failures == 0
+
     renderer.fail_generation = False
     renderer.fail_tts = True
-    await _fail_renders(renderer, "djlive_002")
+    # the scripts of these two render fine, so the query's count is back to zero while the
+    # voice now counts its own failures - four failures in one bucket would already pause
+    await _fail_renders(renderer, "djlive_003", "djlive_004")
+    assert state.render_health.ai.failures == 0
+    assert state.render_health.tts.failures == 2
+    assert not state.render_health.cooling_down(asyncio.get_running_loop().time())
+
+    with caplog.at_level(logging.WARNING, logger="tests.ai_radio.rendering"):
+        await _fail_renders(renderer, "djlive_005")
+
+    # the voice trips its own, shorter pause
+    assert state.render_health.tts_cooling_down(asyncio.get_running_loop().time())
+    assert not state.render_health.ai_cooling_down(asyncio.get_running_loop().time())
+    assert renderer.paused == [("player_a", "qi_djlive_005", TTS_COOLDOWN_SECONDS)]
+    warnings = _pause_warnings(caplog)
+    assert len(warnings) == 1
+    assert "TTS engine failed 3 times" in warnings[0]
+
+
+async def test_a_failing_ai_query_pauses_only_the_query(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Three failed queries pause the AI engine for fifteen minutes, and say so."""
+    renderer, state = _failing_dj_renderer(4)
     renderer.fail_tts = False
     renderer.fail_generation = True
 
     with caplog.at_level(logging.WARNING, logger="tests.ai_radio.rendering"):
-        await _fail_renders(renderer, "djlive_003")
+        await _fail_renders(renderer, "djlive_001", "djlive_002", "djlive_003")
 
-    assert state.render_health.cooling_down(asyncio.get_running_loop().time())
+    assert state.render_health.ai_cooling_down(asyncio.get_running_loop().time())
+    assert not state.render_health.tts_cooling_down(asyncio.get_running_loop().time())
+    assert renderer.paused == [("player_a", "qi_djlive_003", AI_COOLDOWN_SECONDS)]
     warnings = _pause_warnings(caplog)
     assert len(warnings) == 1
-    assert "AI engine 'engine-x'" in warnings[0]
+    assert "AI engine failed 3 times" in warnings[0]
+    assert "15 minutes" in warnings[0]
+
+
+async def test_a_paused_query_still_voices_a_script_that_exists() -> None:
+    """A clip whose script is already written only needs the voice, so no query is asked."""
+    renderer, state = _failing_dj_renderer(1)
+    renderer.fail_tts = False
+    item = _dj_clip_item("djlive", 1, **{ATTR_RENDERED_TEXT: "Good evening, it is warm out."})
+    _attach_queue(renderer, [item])
+    state.render_health.ai.cooldown_until = asyncio.get_running_loop().time() + 100
+
+    await renderer.get_stream_details("djlive_001", MediaType.SOUND_EFFECT)
+
+    assert renderer.llm_calls == 0
+    assert renderer.tts_texts == ["Good evening, it is warm out."]
+
+
+async def test_a_paused_query_holds_back_a_clip_whose_script_is_missing() -> None:
+    """A clip that still has to be written can not be spoken while the query is paused."""
+    renderer, state = _failing_dj_renderer(1)
+    renderer.fail_tts = False
+    _attach_queue(renderer, [_dj_clip_item("djlive", 1)])
+    state.render_health.ai.cooldown_until = asyncio.get_running_loop().time() + 100
+
+    with pytest.raises(MediaNotFoundError):
+        await renderer.get_stream_details("djlive_001", MediaType.SOUND_EFFECT)
+
+    assert renderer.llm_calls == 0
+    assert renderer.tts_texts == []
 
 
 async def test_a_failure_after_the_cool_down_restarts_it(caplog: pytest.LogCaptureFixture) -> None:
@@ -823,51 +919,58 @@ async def test_a_failure_after_the_cool_down_restarts_it(caplog: pytest.LogCaptu
 
     with caplog.at_level(logging.WARNING, logger="tests.ai_radio.rendering"):
         await _fail_renders(renderer, "djlive_001", "djlive_002", "djlive_003")
-        state.render_health.cooldown_until = loop.time() - 1
+        state.render_health.tts.cooldown_until = loop.time() - 1
         await _fail_renders(renderer, "djlive_004")
 
     assert renderer.llm_calls == 4
-    assert state.render_health.cooling_down(loop.time())
+    assert state.render_health.tts_cooling_down(loop.time())
     assert len(_pause_warnings(caplog)) == 2
-    assert [item_id for _queue_id, item_id in renderer.paused] == ["qi_djlive_003", "qi_djlive_004"]
+    assert [item_id for _queue_id, item_id, _seconds in renderer.paused] == [
+        "qi_djlive_003",
+        "qi_djlive_004",
+    ]
 
 
 def test_a_late_result_during_the_cool_down_leaves_it_alone() -> None:
-    """A render that was in flight when the pause started neither extends nor ends the pause."""
+    """A call in flight when the pause started neither extends nor ends it, on either engine."""
     health = RenderHealth()
-    assert [health.record_failure(100.0) for _ in range(3)] == [False, False, True]
-    paused_until = health.cooldown_until
+    part = RenderPart.TTS
+    assert [health.record_failure(part, 100.0) for _ in range(3)] == [False, False, True]
+    paused_until = health.tts.cooldown_until
 
-    assert health.record_failure(105.0) is False
-    assert health.failures == 4
-    assert health.cooldown_until == paused_until
-    health.record_success(110.0)
-    assert health.failures == 4
-    assert health.cooldown_until == paused_until
-    # once the pause is over the next render decides: a failure starts a new pause, a
+    assert health.record_failure(part, 105.0) is False
+    assert health.tts.failures == 4
+    assert health.tts.cooldown_until == paused_until
+    health.record_success(part, 110.0)
+    assert health.tts.failures == 4
+    assert health.tts.cooldown_until == paused_until
+    # the AI engine never failed, so its own pause stays empty throughout
+    assert health.ai.failures == 0
+    assert health.ai.cooldown_until is None
+    # once the pause is over the next call decides: a failure starts a new pause, a
     # success lifts it
     assert paused_until is not None
-    assert health.record_failure(paused_until) is True
-    restarted_until = health.cooldown_until
+    assert health.record_failure(part, paused_until) is True
+    restarted_until = health.tts.cooldown_until
     assert restarted_until is not None
     assert restarted_until > paused_until
-    health.record_success(restarted_until)
-    assert health.failures == 0
-    assert health.cooldown_until is None
+    health.record_success(part, restarted_until)
+    assert health.tts.failures == 0
+    assert health.tts.cooldown_until is None
 
 
 async def test_a_success_after_the_cool_down_lifts_it() -> None:
     """Once the cool-down is over a render that succeeds lets the DJ render freely again."""
     renderer, state = _failing_dj_renderer(4)
     await _fail_renders(renderer, "djlive_001", "djlive_002", "djlive_003")
-    state.render_health.cooldown_until = asyncio.get_running_loop().time() - 1
+    state.render_health.tts.cooldown_until = asyncio.get_running_loop().time() - 1
     renderer.fail_tts = False
 
     await renderer.get_stream_details("djlive_004", MediaType.SOUND_EFFECT)
 
     assert renderer.llm_calls == 4
-    assert state.render_health.failures == 0
-    assert state.render_health.cooldown_until is None
+    assert state.render_health.tts.failures == 0
+    assert state.render_health.tts.cooldown_until is None
 
 
 async def test_the_queue_update_of_the_pausing_failure_finds_the_dj_paused() -> None:
@@ -894,7 +997,7 @@ async def test_a_clip_left_by_an_earlier_dj_session_counts_against_the_live_dj()
     await _fail_renders(renderer, "djold_001", "djold_002", "djold_003")
 
     assert state.render_health.cooling_down(asyncio.get_running_loop().time())
-    assert renderer.paused == [("player_a", "qi_djold_003")]
+    assert renderer.paused == [("player_a", "qi_djold_003", TTS_COOLDOWN_SECONDS)]
 
 
 async def test_a_clip_of_a_host_switched_away_mid_render_counts_nowhere() -> None:
@@ -907,7 +1010,7 @@ async def test_a_clip_of_a_host_switched_away_mid_render_counts_nowhere() -> Non
 
     await _fail_renders(renderer, "djold_001", "djold_002", "djold_003")
 
-    assert state.render_health.failures == 0
+    assert state.render_health.tts.failures == 0
     assert renderer.paused == []
 
 
@@ -1527,6 +1630,7 @@ def _attach_post(
     boundary_mix_required: bool = False,
     mixes_item_boundaries: bool = False,
     load_next: QueueItem | Exception | None = None,
+    crossfade_mode: CrossfadeMode = CrossfadeMode.STANDARD_CROSSFADE,
 ) -> tuple[AsyncMock, AsyncMock]:
     """
     Wire the next queue item, how the queue mixes it, its stored analysis and its lyrics.
@@ -1554,6 +1658,7 @@ def _attach_post(
     mass.streams.flow_mode_required = MagicMock(return_value=flow_mode_required)
     mass.streams.boundary_mix_required = MagicMock(return_value=boundary_mix_required)
     mass.streams.mixes_item_boundaries = MagicMock(return_value=mixes_item_boundaries)
+    mass.streams.get_crossfade_mode = MagicMock(return_value=crossfade_mode)
     get_vocal_onset = AsyncMock(return_value=analysis_onset)
     mass.streams.audio_analysis = SimpleNamespace(get_vocal_onset=get_vocal_onset)
     get_track_lyrics = AsyncMock(return_value=lyrics)
@@ -2124,7 +2229,7 @@ async def test_a_clip_that_fails_to_render_ahead_is_left_unplayable() -> None:
     await asyncio.gather(*started.values())
 
     assert clip.available is False
-    assert state.render_health.failures == 1
+    assert state.render_health.tts.failures == 1
 
 
 async def test_a_weather_required_clip_without_weather_is_left_unplayable() -> None:
@@ -2266,3 +2371,335 @@ async def test_the_timestamp_counts_real_seconds_across_a_clock_change(
     await asyncio.gather(*started.values())
 
     assert expected in renderer.llm_prompts[0]
+
+
+def test_the_pre_takes_the_part_of_the_break_the_post_leaves() -> None:
+    """A pre carries the part of the break the post does not, capped and never tiny."""
+    renderer = DummyRenderer()
+    song = _song(0)
+    clip = _dj_clip_item("djlive", 1)
+    _attach_queue(renderer, [song, clip])
+    _attach_post(renderer, None)
+
+    # the stream never blends more than half the incoming item, so neither does the plan
+    assert renderer._plan_pre(clip, 8.0, None) == (4.0, song.queue_item_id)
+    assert renderer._plan_pre(
+        clip,
+        8.0,
+        TailOverlap(duration=4.0, next_queue_item_id="qi_track"),
+    ) == (4.0, song.queue_item_id)
+    assert renderer._plan_pre(clip, 45.0, None) == (TALK_OVER_MAX_PRE, song.queue_item_id)
+    assert renderer._plan_pre(clip, 0.4, None) == (None, None)
+
+
+def test_the_pre_needs_a_track_before_the_clip() -> None:
+    """An opening clip has nothing to play over, so no pre is planned for it."""
+    renderer = DummyRenderer()
+    clip = _dj_clip_item("djlive", 1)
+    _attach_queue(renderer, [clip])
+    _attach_post(renderer, None)
+
+    assert renderer._plan_pre(clip, 8.0, None) == (None, None)
+
+
+def test_no_pre_is_planned_on_a_queue_that_plays_without_crossfade() -> None:
+    """Nothing of the previous track is held back without a crossfade, so no head is planned."""
+    renderer = DummyRenderer()
+    song = _song(0)
+    clip = _dj_clip_item("djlive", 1)
+    _attach_queue(renderer, [song, clip])
+    _attach_post(renderer, None, crossfade_mode=CrossfadeMode.DISABLED)
+
+    assert renderer._plan_pre(clip, 8.0, None) == (None, None)
+
+
+def test_a_pre_is_planned_only_where_the_player_mixes_its_item_boundaries(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A gapless player without a flow stream carries a head; one that mixes nothing gets none.
+
+    The head is mixed across the boundary between two item streams, so a player that plays
+    its items gapless is enough on its own, and a player that neither plays gapless nor
+    streams in flow mode is told why its pre was skipped instead of getting a plan that can
+    never be heard.
+    """
+    song = _song(0)
+    clip = _dj_clip_item("djlive", 1)
+    gapless = DummyRenderer()
+    _attach_queue(gapless, [song, clip])
+    _attach_post(gapless, None, flow_mode=False, mixes_item_boundaries=True)
+
+    assert gapless._plan_pre(clip, 8.0, None) == (4.0, song.queue_item_id)
+    cast("Any", gapless).mass.streams.mixes_item_boundaries.assert_called_once_with("player_a")
+
+    plain = DummyRenderer()
+    plain_song = _song(0)
+    plain_clip = _dj_clip_item("djlive", 1)
+    _attach_queue(plain, [plain_song, plain_clip])
+    _attach_post(plain, None, flow_mode=False)
+
+    with caplog.at_level(logging.INFO, logger="tests.ai_radio.rendering"):
+        assert plain._plan_pre(plain_clip, 8.0, None) == (None, None)
+
+    assert (
+        f"AI Radio pre skipped on {plain_song.name}: the player neither plays gapless nor "
+        "streams in flow mode" in caplog.messages
+    )
+
+
+async def test_a_pre_caps_the_post_at_half_the_break() -> None:
+    """With both halves allowed the break splits at the boundary instead of keeping a head."""
+    renderer = DummyRenderer()
+    song = _song(0)
+    clip = _posting_clip_item()
+    clip.extra_attributes[ATTR_ALLOW_PRE] = True
+    _attach_queue(renderer, [song, clip])
+    _attach_post(renderer, _track_item(), analysis_onset=60.0)
+
+    streamdetails = await renderer.get_stream_details("sess_001", MediaType.SOUND_EFFECT)
+
+    assert streamdetails.duration is not None
+    assert streamdetails.tail_overlap is not None
+    half = streamdetails.duration / 2
+    assert streamdetails.tail_overlap.duration == pytest.approx(half, abs=0.1)
+    assert clip.extra_attributes[ATTR_PRE_OVERLAP] == pytest.approx(half, abs=0.1)
+    assert clip.extra_attributes[ATTR_PRE_FROM] == song.queue_item_id
+
+
+def test_a_whole_break_head_is_not_capped_at_half_the_break() -> None:
+    """A head that carries the break alone reaches further back than half of it, up to the limit."""
+    renderer = DummyRenderer()
+    song = _song(0)
+    clip = _dj_clip_item("djlive", 1)
+    _attach_queue(renderer, [song, clip])
+    _attach_post(renderer, None)
+
+    assert renderer._plan_pre(clip, 8.0, None, whole_break="no post") == (
+        8.0,
+        song.queue_item_id,
+    )
+    assert renderer._plan_pre(clip, 45.0, None, whole_break="no post") == (
+        TALK_OVER_MAX_PRE,
+        song.queue_item_id,
+    )
+    assert renderer._plan_pre(clip, 0.4, None, whole_break="no post") == (None, None)
+
+
+async def test_the_pre_takes_the_whole_break_when_the_post_cannot_air(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A break whose post has no instrumental intro carries all of itself over the outro."""
+    renderer = DummyRenderer()
+    song = _song(0)
+    clip = _posting_clip_item()
+    clip.extra_attributes[ATTR_ALLOW_PRE] = True
+    _attach_queue(renderer, [song, clip])
+    _attach_post(renderer, _track_item(), analysis_onset=0.5)
+
+    with caplog.at_level(logging.INFO, logger="tests.ai_radio.rendering"):
+        streamdetails = await renderer.get_stream_details("sess_001", MediaType.SOUND_EFFECT)
+
+    assert streamdetails.duration == 9
+    assert streamdetails.tail_overlap is None
+    assert clip.extra_attributes[ATTR_PRE_OVERLAP] == streamdetails.duration
+    assert clip.extra_attributes[ATTR_PRE_FROM] == song.queue_item_id
+    assert any("pre takes the whole break" in message for message in caplog.messages)
+    dropped = [message for message in caplog.messages if "post dropped" in message]
+    assert dropped
+    assert all("vocal enters at 0.5s" in message for message in dropped)
+
+
+async def test_the_whole_break_head_stops_at_the_reach_back_limit() -> None:
+    """A break longer than the stream reaches back plays its head over the outro and the rest on."""
+    renderer = DummyRenderer()
+    cast("Any", renderer)._probe_duration = AsyncMock(return_value=40)
+    song = _song(0)
+    clip = _posting_clip_item()
+    clip.extra_attributes[ATTR_ALLOW_PRE] = True
+    _attach_queue(renderer, [song, clip])
+    _attach_post(renderer, _track_item(), analysis_onset=0.5)
+
+    streamdetails = await renderer.get_stream_details("sess_001", MediaType.SOUND_EFFECT)
+
+    assert streamdetails.tail_overlap is None
+    assert clip.extra_attributes[ATTR_PRE_OVERLAP] == TALK_OVER_MAX_PRE
+    assert clip.extra_attributes[ATTR_PRE_FROM] == song.queue_item_id
+
+
+async def test_the_pre_and_the_post_add_up_to_the_break() -> None:
+    """When the post fits, the break still splits at the boundary with no body left on the item."""
+    renderer = DummyRenderer()
+    song = _song(0)
+    clip = _posting_clip_item()
+    clip.extra_attributes[ATTR_ALLOW_PRE] = True
+    _attach_queue(renderer, [song, clip])
+    _attach_post(renderer, _track_item(), analysis_onset=12.0)
+
+    streamdetails = await renderer.get_stream_details("sess_001", MediaType.SOUND_EFFECT)
+
+    assert streamdetails.duration is not None
+    assert streamdetails.tail_overlap is not None
+    pre = cast("float", clip.extra_attributes[ATTR_PRE_OVERLAP])
+    assert pre >= MIN_PRE_SECONDS
+    assert pre + streamdetails.tail_overlap.duration == pytest.approx(streamdetails.duration)
+
+
+async def test_a_break_without_a_pre_whose_post_cannot_air_plays_whole_at_the_boundary() -> None:
+    """A section that opts out of a pre keeps today's behaviour: nothing is mixed for it."""
+    renderer = DummyRenderer()
+    clip = _posting_clip_item()
+    _attach_queue(renderer, [_song(0), clip])
+    _attach_post(renderer, _track_item(), analysis_onset=0.5)
+
+    streamdetails = await renderer.get_stream_details("sess_001", MediaType.SOUND_EFFECT)
+
+    assert streamdetails.tail_overlap is None
+    assert ATTR_PRE_OVERLAP not in clip.extra_attributes
+    assert ATTR_PRE_FROM not in clip.extra_attributes
+
+
+async def test_a_section_without_a_post_publishes_its_whole_break_head_ahead() -> None:
+    """A section that plays no post has its head known before the track under it even starts."""
+    renderer = DummyRenderer()
+    song = _song(0)
+    clip = _dj_clip_item("djlive", 1)
+    _attach_queue(renderer, [song, clip])
+    _attach_post(renderer, _track_item(), analysis_onset=0.5)
+    clip.extra_attributes[ATTR_ALLOW_PRE] = True
+    started = _play_queue(renderer)
+
+    renderer._render_ahead("player_a")
+    await asyncio.gather(*started.values())
+
+    assert clip.extra_attributes[ATTR_PRE_OVERLAP] == 9
+    assert clip.extra_attributes[ATTR_PRE_FROM] == song.queue_item_id
+
+
+async def test_a_section_mixed_into_a_stream_comes_back_in_its_pcm_format(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A program mixed into a queue's stream is delivered as PCM in that stream's format."""
+    renderer = DummyRenderer()
+    calls: list[dict[str, Any]] = []
+    flow_format = AudioFormat(
+        content_type=ContentType.PCM_S16LE, sample_rate=48000, bit_depth=16, channels=2
+    )
+
+    async def _fake_stream(**kwargs: Any) -> AsyncGenerator[bytes]:
+        calls.append(kwargs)
+        yield b"\x01\x00" * 4
+        yield b"\x02\x00" * 4
+
+    monkeypatch.setattr(
+        "music_assistant.providers.ai_radio.rendering.get_ffmpeg_stream", _fake_stream
+    )
+    _attach_queue(renderer, [])
+    renderer._hosts["rick"] = {"id": "rick", "language": "en_US"}
+
+    pcm = await renderer._render_section_pcm(
+        "player_a", {"host_id": "rick"}, _section(), flow_format
+    )
+
+    assert pcm == b"\x01\x00" * 4 + b"\x02\x00" * 4
+    assert calls[0]["output_format"] == flow_format
+    assert calls[0]["input_format"].content_type == ContentType.MP3
+    # the deferred placeholder names the moment it airs, not the literal token
+    assert "<timestamp>" not in renderer.llm_prompts[0]
+    assert renderer.tts_texts == ["Good evening, it is warm out."]
+
+
+async def test_a_mixed_section_is_levelled_like_a_clip_that_plays_as_an_item(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stream render levels its section with the very chain the item path serves."""
+    chains: list[list[str]] = []
+
+    async def fake_ffmpeg_stream(**kwargs: Any) -> AsyncGenerator[bytes]:
+        chains.append(kwargs["filter_params"])
+        yield b"pcm"
+
+    monkeypatch.setattr(
+        "music_assistant.providers.ai_radio.rendering.get_ffmpeg_stream", fake_ffmpeg_stream
+    )
+    renderer = DummyRenderer()
+    renderer.measured_loudness = -18.0
+    _attach_queue(renderer, [_clip_item("sess_001")])
+    _attach_normalization(renderer, target=-14, boost=3)
+    renderer._hosts["rick"] = {"id": "rick", "language": "en_US"}
+    flow_format = AudioFormat(
+        content_type=ContentType.PCM_S16LE, sample_rate=48000, bit_depth=16, channels=2
+    )
+
+    streamdetails = await renderer.get_stream_details("sess_001", MediaType.SOUND_EFFECT)
+    [chunk async for chunk in renderer.get_audio_stream(streamdetails)]
+    await renderer._render_section_pcm(
+        "player_a", {"host_id": "rick"}, _section("intro"), flow_format
+    )
+
+    item_chain, bus_chain = chains
+    assert bus_chain == item_chain
+    # the peaks of a mixed-in break are held under the mix ceiling too
+    assert bus_chain[-1] == f"alimiter=limit={TTS_PEAK_CEILING_DB}dB:level=false:latency=true"
+
+
+async def test_the_item_path_serves_its_clip_whole_beyond_the_ceiling(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A clip that plays as an item is never cut by the host's contribution ceiling."""
+    seconds = 20
+
+    async def fake_ffmpeg_stream(**_kwargs: Any) -> AsyncGenerator[bytes]:
+        for _ in range(seconds):
+            yield b"\x00\x00" * (TTS_CLIP_PCM_FORMAT.sample_rate * TTS_CLIP_PCM_FORMAT.channels)
+
+    monkeypatch.setattr(
+        "music_assistant.providers.ai_radio.rendering.get_ffmpeg_stream", fake_ffmpeg_stream
+    )
+    renderer = DummyRenderer()
+    renderer.measured_loudness = -18.0
+    _attach_queue(renderer, [_clip_item("sess_001", **{ATTR_HOST_ID: "rick"})])
+    _attach_normalization(renderer, target=-14, boost=3)
+    # the host allows far less than the clip lasts, which the item path never reads
+    renderer._hosts["rick"] = {"id": "rick", "max_contribution_seconds": 15}
+
+    streamdetails = await renderer.get_stream_details("sess_001", MediaType.SOUND_EFFECT)
+    served = b"".join([chunk async for chunk in renderer.get_audio_stream(streamdetails)])
+
+    frame_bytes = (TTS_CLIP_PCM_FORMAT.bit_depth // 8) * TTS_CLIP_PCM_FORMAT.channels
+    assert len(served) == seconds * TTS_CLIP_PCM_FORMAT.sample_rate * frame_bytes
+
+
+@pytest.mark.parametrize(("boost", "gain"), [(0, 0.0), (6, 6.0)])
+async def test_the_mixed_section_carries_the_configured_boost(
+    monkeypatch: pytest.MonkeyPatch, boost: int, gain: float
+) -> None:
+    """A section mixed into the stream is lifted by the same boost its item path would apply."""
+    chains: list[list[str]] = []
+
+    async def fake_ffmpeg_stream(**kwargs: Any) -> AsyncGenerator[bytes]:
+        chains.append(kwargs["filter_params"])
+        yield b"pcm"
+
+    monkeypatch.setattr(
+        "music_assistant.providers.ai_radio.rendering.get_ffmpeg_stream", fake_ffmpeg_stream
+    )
+    renderer = DummyRenderer()
+    # the measurement lands on the target, so the boost alone decides the gain
+    renderer.measured_loudness = -14.0
+    _attach_queue(renderer, [_clip_item("sess_001")])
+    _attach_normalization(renderer, target=-14, boost=boost)
+    renderer._hosts["rick"] = {"id": "rick", "language": "en_US"}
+    flow_format = AudioFormat(
+        content_type=ContentType.PCM_S16LE, sample_rate=48000, bit_depth=16, channels=2
+    )
+
+    await renderer._render_section_pcm(
+        "player_a", {"host_id": "rick"}, _section("intro"), flow_format
+    )
+
+    assert chains[0] == [
+        TTS_SPEECHNORM_FILTER,
+        f"volume={round(gain, 2)}dB",
+        f"alimiter=limit={TTS_PEAK_CEILING_DB}dB:level=false:latency=true",
+    ]

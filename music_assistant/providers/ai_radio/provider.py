@@ -54,6 +54,7 @@ from .queue_dj import AIRadioQueueDJMixin
 from .rendering import AIRadioRenderMixin
 from .runtime import AIRadioRuntimeMixin
 from .storage import AIRadioStorageMixin
+from .term_engine import AIRadioTermEngineMixin
 
 if TYPE_CHECKING:
     from music_assistant_models.config_entries import ConfigEntry, ProviderConfig
@@ -75,6 +76,7 @@ class AIRadioProvider(
     AIRadioRuntimeMixin,
     AIRadioRenderMixin,
     AIRadioHostsMixin,
+    AIRadioTermEngineMixin,
     AIRadioIntroMixin,
     AIRadioQueueDJMixin,
     AIRadioStorageMixin,
@@ -162,6 +164,8 @@ class AIRadioProvider(
             ("ai_radio/hosts/presets/list", self.list_host_presets),
             ("ai_radio/engines/tts/list", self.list_tts_engines),
             ("ai_radio/queue_dj/set", self.set_queue_dj),
+            ("ai_radio/queue_dj/set_voice_level", self.set_queue_dj_voice_level),
+            ("ai_radio/queue_dj/set_duck", self.set_queue_dj_duck),
             ("ai_radio/queue_dj/status", self.get_queue_dj_status),
         )
         # playing a station takes what playing anything takes, and the stations are part of
@@ -202,6 +206,9 @@ class AIRadioProvider(
                 ),
             )
         )
+        # a queue still holding clips an older release spliced in for the DJ is cleaned
+        # before the first replan plans against it
+        await self._cleanup_legacy_dj_items()
         # resume injection on the queues that were armed before this (re)start, without
         # waiting for a queue event that a paused or idle queue may never send
         for queue_id in list(self._dj_queues):
@@ -219,7 +226,7 @@ class AIRadioProvider(
         for queue_id, state in self._dj_queues.items():
             if state.task and not state.task.done():
                 state.task.cancel()
-            self.mass.streams.set_boundary_mix_required(queue_id, self.instance_id, False)
+            self._release_stream_claims(queue_id)
         self._cancel_renders_ahead()
         for handle in self._unregister_handles:
             handle()
@@ -295,6 +302,9 @@ class AIRadioProvider(
             self._sections[normalized["id"]] = normalized
             await self._write_sections()
         self.logger.info("AI Radio section saved: %s", normalized["id"])
+        # an edit decides whether this host's breaks straddle a boundary: a queue it is
+        # armed on picks that up when its current stream ends and the next one starts
+        self._refresh_stream_claims()
         return deepcopy(normalized)
 
     async def delete_section(self, section_id: str) -> None:
@@ -343,6 +353,8 @@ class AIRadioProvider(
             self._hosts[normalized["id"]] = normalized
             await self._write_hosts()
         self.logger.info("AI Radio host saved: %s (%s)", normalized["id"], normalized["name"])
+        # the host's sections decide the claim, so a changed list applies to its queues
+        self._refresh_stream_claims()
         return deepcopy(normalized)
 
     async def delete_host(self, host_id: str) -> None:
