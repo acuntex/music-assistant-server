@@ -763,6 +763,7 @@ def _direct_pcm_stream(rig: SlotRig, queue_item: QueueItem) -> AsyncGenerator[by
     ctrl._active_output_streams = 0
     ctrl._flow_mode_owners = {}
     ctrl._boundary_mix_owners = {}
+    ctrl._lead_hold_owners = {}
     ctrl._get_live_audio_source_session = Mock(return_value=None)
     ctrl._update_audio_processing_context = Mock()
     media = PlayerMedia(

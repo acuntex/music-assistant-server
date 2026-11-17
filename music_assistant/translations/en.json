@@ -260,6 +260,8 @@
   "common.config_entries.scrobble_players.label": "Scrobble for players",
   "common.config_entries.scrobble_users.description": "Only register scrobbles for the selected users. Leave empty to scrobble for all users.",
   "common.config_entries.scrobble_users.label": "Scrobble for users",
+  "common.config_entries.stream_program_bus.description": "Mixes announcements and spoken breaks into the stream that is already playing, instead of pausing it. Announcements sent with the overlay mode, and AI Radio breaks that start over the tail of a track, are heard over the music this way; without it they interrupt playback or wait for the boundary between two tracks.",
+  "common.config_entries.stream_program_bus.label": "Experimental: mix announcements into the running stream (program bus)",
   "common.config_entries.suffix_version.description": "Whether to add the version as suffix to track names, e.g. 'Amazing Track (Live)'.",
   "common.config_entries.suffix_version.label": "Suffix version to track names",
   "common.config_entries.sync_adjust.description": "If this player is playing audio synced with other players and you always hear the audio too early or late on this player, you can shift the audio a bit. \nPositive values make this player play earlier; negative values make it play later. \nExample: enter the extra delay of an amplifier or TV connected to this player, in milliseconds, so it plays that much earlier.",

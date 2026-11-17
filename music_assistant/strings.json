@@ -461,6 +461,10 @@
     },
     "image_engine_unavailable": {
       "label": "No image engine is available. Set up a plugin that can generate images, for example the Home Assistant plugin with an AI task entity that supports images, or the OpenAI Compatible plugin with an image model selected."
+    },
+    "stream_program_bus": {
+      "label": "Experimental: mix announcements into the running stream (program bus)",
+      "description": "Mixes announcements and spoken breaks into the stream that is already playing, instead of pausing it. Announcements sent with the overlay mode, and AI Radio breaks that start over the tail of a track, are heard over the music this way; without it they interrupt playback or wait for the boundary between two tracks."
     }
   },
   "config_categories": {

@@ -135,6 +135,7 @@ def _url_controller() -> Any:
     controller._base_url = "http://mass:8097"
     controller._flow_mode_owners = {}
     controller._boundary_mix_owners = {}
+    controller._lead_hold_owners = {}
     controller.mass = mass = MagicMock()
     protocol = MagicMock()
     protocol.config.get_value.side_effect = lambda _key, default=None: default

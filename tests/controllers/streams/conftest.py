@@ -17,9 +17,11 @@ from music_assistant.constants import (
 from music_assistant.controllers.streams.controller import StreamsController
 from music_assistant.controllers.tasks import TasksController
 from music_assistant.helpers.ffmpeg import LOGGER as FFMPEG_LOGGER
+from tests.controllers.streams.program_bus_helpers import bare_streams_controller
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncGenerator, Iterator
+    from collections.abc import AsyncGenerator, Callable, Iterator
+    from typing import Any
 
     from music_assistant.mass import MusicAssistant
 
@@ -71,6 +73,12 @@ async def setup_streams(
     assert isinstance(port, int)
     assert port != 0
     return port
+
+
+@pytest.fixture
+def make_streams_controller() -> Callable[..., Any]:
+    """Return a factory for a bare streams controller that can mix programs."""
+    return bare_streams_controller
 
 
 @pytest.fixture

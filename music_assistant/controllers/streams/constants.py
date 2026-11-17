@@ -216,6 +216,39 @@ MIN_VOICE_OVER_DURATION: Final[float] = 1.0
 # Seconds over which the music under a voice over ramps back to full level once the
 # voice has ended.
 VOICE_OVER_RAMP: Final[float] = 0.4
+# Furthest a break may reach back over the running track's tail (a "pre"). Providers that
+# plan one publish it on the clip queue item, but the tail of the track before it has to be
+# held back before that plan exists, so the hold is armed for this much.
+MAX_LEAD_OVERLAP: Final[float] = 12.0
+# What a track's tail hold is widened to so a planned lead can be mixed; the voice needs its
+# ramp on top of the lead itself.
+LEAD_HOLD_CEILING: Final[float] = MAX_LEAD_OVERLAP + VOICE_OVER_RAMP
+# Shortest lead a program can still be mixed in: AudioBuffer target + encoder prefill +
+# group buffer, measured.
+LEAD_MIN_LEAD_SECONDS: Final[float] = 2.0
+# Tolerance a program timed to a boundary may miss it by; one-sided, so starting early is
+# always allowed (the head then lies over the outgoing item).
+MAX_OVERLAY_LATE_SECONDS: Final[float] = 1.0
+# Furthest a player sits behind the stream the server produced. Audio buffered between the two
+# is what a program placed "now" does not have to wait for; a position further back than this is
+# a clock that is not this stream's (an item's own position, or a stream already replaced), so it
+# says nothing about that buffer.
+MAX_BUFFERED_LEAD_SECONDS: Final[float] = 60.0
+# How much more than the tail overlap it declared a clip may still deliver and be carried
+# over the boundary whole. The plan splits a clip into a head and a tail overlap, and an
+# item's declared duration is a whole-second estimate, so a little more audio is expected.
+BUS_CLIP_CARRY_SLACK: Final[float] = 2.0
+# How far a clip's head may fall short of its declared length and still count as planned
+# over it whole. Only the whole-second duration and the frame-aligned read of the head are
+# absorbed: whether the clip really ends there is read from its stream, and anything past
+# the head is served as the clip's own body, however short.
+BUS_CLIP_HEAD_SLACK: Final[float] = 0.5
+# Experimental: mix announcements into the running flow stream instead of interrupting it.
+CONF_STREAM_PROGRAM_BUS: Final[str] = "stream_program_bus"
+# QueueItem.extra_attributes keys a provider uses to declare that a clip starts over the
+# tail of the item before it: the seconds, and the item id it was planned against.
+PRE_OVERLAP_ATTR: Final[str] = "ai_radio_pre_overlap"
+PRE_OVERLAP_FROM_ATTR: Final[str] = "ai_radio_pre_from"
 
 # Maximum wait for a provider source-stream slot before a speculative attempt gives up.
 STREAM_SLOT_WAIT_TIMEOUT: Final[float] = 5.0
