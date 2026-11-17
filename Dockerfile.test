@@ -1,0 +1,49 @@
+# Fork-only test image: the official image plus our tree (frontend rebuilt from
+# acuntex/music-assistant-frontend:feat/streams-program-bus at build time).
+#
+# Building the full image from a fork loses helpers/app_secrets.json (injected from
+# a private repo at release time), which empties the Spotify/Tidal/Qobuz/LastFM
+# app keys. Overlaying keeps every bit of the official image intact.
+#
+# The whole music_assistant package is copied, not a list of files: the branch
+# follows upstream dev, which moves faster than the released base image, so a
+# hand-kept list silently leaves files behind (that is how a rebased tree ended up
+# importing names the base image's constants.py does not have). COPY merges, so
+# app_secrets.json from the base image survives.
+ARG BASE_IMAGE=ghcr.io/music-assistant/server:2.11.0.dev2026111303
+FROM ${BASE_IMAGE}
+
+USER root
+
+# The branch follows upstream dev, which also *removes* files (the universal_player
+# provider, for one). A merging COPY would leave those behind, and the leftovers then
+# import names our constants no longer have, so the package is replaced wholesale.
+# The release's app_secrets.json is put back afterwards: the fork has no copy of it,
+# and without it the Spotify/Tidal/Qobuz app keys are empty.
+RUN mkdir -p /tmp/app_secrets \
+    && cp -a /app/venv/lib/python3.14/site-packages/music_assistant/helpers/app_secrets.json /tmp/app_secrets/ \
+    || true
+RUN rm -rf /app/venv/lib/python3.14/site-packages/music_assistant
+COPY music_assistant/ /app/venv/lib/python3.14/site-packages/music_assistant/
+RUN mkdir -p /app/venv/lib/python3.14/site-packages/music_assistant/helpers \
+    && cp -a /tmp/app_secrets/app_secrets.json /app/venv/lib/python3.14/site-packages/music_assistant/helpers/ \
+    || true
+
+# Dependencies the branch has that the base release predates. Keep in step with
+# pyproject.toml when it moves: hass-client and the models package are the two
+# that changed between the base image and upstream dev.
+# The released image ships a uv-built venv without pip, so the install goes
+# through uv, taken from the official image for that one step.
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+RUN uv pip install --python /app/venv/bin/python --no-cache \
+        "hass-client==1.4.1" \
+        "music-assistant-models==1.1.242"
+
+# The frontend build from acuntex/music-assistant-frontend:feat/streams-program-bus,
+# which carries the outro switch and the program bus panel. Its `pnpm build` writes
+# the bundle straight into a Python package, so it overlays that package here. The
+# old assets go first: the base image's hashed chunks are never referenced again.
+RUN rm -rf /app/venv/lib/python3.14/site-packages/music_assistant_frontend/assets
+COPY frontend/music_assistant_frontend/ /app/venv/lib/python3.14/site-packages/music_assistant_frontend/
+
+USER 1000:1001
