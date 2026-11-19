@@ -37,7 +37,7 @@ RUN mkdir -p /app/venv/lib/python3.14/site-packages/music_assistant/helpers \
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 RUN uv pip install --python /app/venv/bin/python --no-cache \
         "hass-client==1.4.1" \
-        "music-assistant-models==1.1.242"
+        "music-assistant-models==1.1.247"
 
 # The frontend build from acuntex/music-assistant-frontend:feat/streams-program-bus,
 # which carries the outro switch and the program bus panel. Its `pnpm build` writes
