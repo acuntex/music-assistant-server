@@ -71,3 +71,11 @@ jobs:
           tags: |
             ghcr.io/${{ github.repository_owner }}/music-assistant-server:ai-radio-program-bus
             ghcr.io/${{ github.repository_owner }}/music-assistant-server:${{ github.sha }}
+
+      # The build only copies files, so a dependency the base image lacks shows up
+      # at startup. Importing the application here fails the run instead.
+      - name: Check that the image starts
+        run: >
+          docker run --rm --entrypoint /app/venv/bin/python
+          ghcr.io/${{ github.repository_owner }}/music-assistant-server:${{ github.sha }}
+          -c "import music_assistant.mass"
