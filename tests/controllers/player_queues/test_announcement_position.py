@@ -12,7 +12,7 @@ import asyncio
 import time
 from types import SimpleNamespace
 from typing import Any, NamedTuple, cast
-from unittest.mock import AsyncMock, MagicMock, Mock
+from unittest.mock import AsyncMock, MagicMock, Mock, call
 
 import pytest
 from music_assistant_models.enums import (
@@ -26,7 +26,10 @@ from music_assistant_models.errors import PlayerCommandFailed
 from music_assistant_models.player_queue import PlayerQueue, PlayLogEntry
 from music_assistant_models.queue_item import QueueItem
 
-from music_assistant.constants import ATTR_ANNOUNCEMENT_IN_PROGRESS
+from music_assistant.constants import (
+    ATTR_ANNOUNCEMENT_HELD_QUEUE,
+    ATTR_ANNOUNCEMENT_IN_PROGRESS,
+)
 from music_assistant.controllers.player_queues.controller import PlayerQueuesController
 from music_assistant.controllers.player_queues.helpers import CompareState
 from music_assistant.controllers.player_queues.state import PlayerQueueData, SleepTimerTarget
@@ -235,6 +238,36 @@ async def test_the_announcement_holds_a_playing_queue_at_the_position_its_stop_s
     assert queue.elapsed_time == SAVED_POSITION
     assert queue.elapsed_time_last_updated == now
     assert _queue_updates(ctrl.mass)[-1] == _Update(PlaybackState.PLAYING, SAVED_POSITION, True)
+
+
+async def test_the_hold_is_published_to_the_player_before_its_device_reports_the_stop() -> None:
+    """The player is told about the held queue, so it keeps playing across the device's stop."""
+    queue = _queue()
+    player = _player()
+    ctrl = _controller(queue, player)
+
+    await _prepare(_announcements(ctrl), player, PlaybackState.PLAYING)
+
+    assert player.extra_data[ATTR_ANNOUNCEMENT_HELD_QUEUE] == QUEUE_ID
+    player.update_state.assert_called_with(force_update=True)
+
+
+async def test_the_player_is_told_when_the_announcement_releases_its_queue() -> None:
+    """The player stops keeping its playing state once the queue is released."""
+    queue = _queue()
+    player = _player(announcement=False)
+    ctrl = _controller(queue, player)
+    announcements = _fallback_announcements(ctrl)
+    announcements._handle_play_media = AsyncMock(  # type: ignore[method-assign]
+        side_effect=PlayerCommandFailed("unreachable")
+    )
+
+    with pytest.raises(PlayerCommandFailed):
+        await announcements._run_announcement(player, _announce_data(), None)
+
+    assert ATTR_ANNOUNCEMENT_HELD_QUEUE not in player.extra_data
+    # once for the hold and once for the release
+    assert player.update_state.call_args_list == [call(force_update=True)] * 2
 
 
 async def test_the_announcement_does_not_hold_a_queue_the_user_paused() -> None:

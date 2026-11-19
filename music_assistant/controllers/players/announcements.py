@@ -343,6 +343,7 @@ class AnnouncementsMixin(_PlayerControllerBase):
             if (
                 held_queue_id := player.extra_data.pop(ATTR_ANNOUNCEMENT_HELD_QUEUE, None)
             ) is not None:
+                player.update_state(force_update=True)
                 try:
                     self.mass.player_queues.release_after_announcement(held_queue_id)
                 except Exception:
@@ -762,6 +763,8 @@ class AnnouncementsMixin(_PlayerControllerBase):
                 await self.mass.player_queues._handle_stop(active_queue.queue_id)
                 if self.mass.player_queues.hold_for_announcement(active_queue.queue_id):
                     player.extra_data[ATTR_ANNOUNCEMENT_HELD_QUEUE] = active_queue.queue_id
+                    # publish the held state before the device reports the stop
+                    player.update_state(force_update=True)
             else:
                 await self._handle_cmd_stop(player.player_id)
             # wait for the player to stop
