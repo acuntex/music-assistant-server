@@ -22,7 +22,7 @@ import asyncio
 import builtins
 import time
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, TypeVar, final, overload
 
 from music_assistant_models.config_entries import ConfigValueType
@@ -52,6 +52,8 @@ from music_assistant_models.unique_list import UniqueList
 from propcache import under_cached_property as cached_property
 
 from music_assistant.constants import (
+    ATTR_ANNOUNCEMENT_HELD_QUEUE,
+    ATTR_DEVICE_PLAYBACK_STATE,
     ATTR_FAKE_MUTE,
     ATTR_FAKE_POWER,
     ATTR_FAKE_VOLUME,
@@ -631,6 +633,7 @@ class Player:
         # after applying any config overrides and other transformations,
         # such as the display name and player controls.
         # the state is updated when calling 'update_state' and is what is sent over the API.
+        self._device_playback_state = PlaybackState.IDLE
         self._state = PlayerState(
             player_id=player_id,
             provider=self.provider_id,
@@ -894,6 +897,17 @@ class Player:
     def current_item_id(self) -> str | None:
         """Return the id of the queue item the player has loaded, else the uri of its media."""
         return self._state.current_item_id
+
+    @property
+    def device_playback_state(self) -> PlaybackState:
+        """
+        Return the playback state the device itself reports.
+
+        It differs from the published playback state only while an announcement holds
+        the queue, which keeps the player published as playing across the stops of the
+        device that the announcement needs.
+        """
+        return self._device_playback_state
 
     @property
     def config(self) -> PlayerConfig:
@@ -1394,6 +1408,14 @@ class Player:
         prev_state = self._state
         self._track_held_volume()
         self._state, effects = derive_player_state(self._collect_state_inputs(reachable))
+        self._device_playback_state = self._state.playback_state
+        if (
+            self.extra_data.get(ATTR_ANNOUNCEMENT_HELD_QUEUE) is not None
+            and self._device_playback_state != PlaybackState.PLAYING
+        ):
+            # the queue plays on after the announcement, so the player does not leave playing
+            # for the stops the announcement needs
+            self._state = replace(self._state, playback_state=PlaybackState.PLAYING)
         self._foreign_protocol_id = effects.foreign_protocol_id
         if effects.clear_active_output:
             self.logger.info("Clearing active output protocol on %s", self.name)
@@ -2361,6 +2383,12 @@ class Player:
                 return True
         return False
 
+    def _device_previous_state(self) -> PlayerState:
+        """Return the state published last, with the playback state the device reported."""
+        if self._state.playback_state == self._device_playback_state:
+            return self._state
+        return replace(self._state, playback_state=self._device_playback_state)
+
     def _diff_state(self, prev_state: PlayerState, reachable: bool) -> dict[str, tuple[Any, Any]]:
         """
         Return the values of the state that changed since the previous calculation.
@@ -2377,6 +2405,7 @@ class Player:
         # not part of the state: whether the device can be reached, which its availability
         # does not tell for a player that is switched off at its power control
         new_fingerprint[ATTR_REACHABLE] = reachable
+        new_fingerprint[ATTR_DEVICE_PLAYBACK_STATE] = self._device_playback_state
         self._state_fingerprint = new_fingerprint
         changed_values: dict[str, tuple[Any, Any]] = {}
         for key in prev_fingerprint.keys() | new_fingerprint.keys():
@@ -2449,7 +2478,7 @@ class Player:
             player_type=self.reported_type,
             channel_layout=own_protocol.channel_layout if own_protocol else None,
             now=time.time(),
-            previous_state=self._state,
+            previous_state=self._device_previous_state(),
             enabled=self._config.enabled,
             name=self._display_name,
             device_name=self._followed_name(),
