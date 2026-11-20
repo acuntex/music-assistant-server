@@ -37,10 +37,10 @@ RUN mkdir -p /app/venv/lib/python3.14/site-packages/music_assistant/helpers \
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 RUN uv pip install --python /app/venv/bin/python --no-cache \
         "hass-client==1.4.1" \
-        "music-assistant-models==1.1.247"
+        "music-assistant-models==1.1.251"
 
-# The frontend build from acuntex/music-assistant-frontend:feat/streams-program-bus,
-# which carries the outro switch and the program bus panel. Its `pnpm build` writes
+# The frontend build from acuntex/music-assistant-frontend:main,
+# which tracks the current frontend. Its `pnpm build` writes
 # the bundle straight into a Python package, so it overlays that package here. The
 # old assets go first: the base image's hashed chunks are never referenced again.
 RUN rm -rf /app/venv/lib/python3.14/site-packages/music_assistant_frontend/assets

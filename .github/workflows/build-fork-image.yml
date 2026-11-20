@@ -15,7 +15,7 @@ permissions:
 
 env:
   FRONTEND_REPOSITORY: acuntex/music-assistant-frontend
-  FRONTEND_REF: feat/streams-program-bus
+  FRONTEND_REF: main
   NODE_VERSION: "22.x"
   PNPM_VERSION: "11.8.0"
 
